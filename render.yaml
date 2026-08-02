@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: medallion-swing
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: MEDALLION_DB_PATH
+        value: /opt/render/project/src/medallion_system.db
+      - key: MEDALLION_MARKET_MODE
+        value: live
+      - key: MEDALLION_SSL_VERIFY
+        value: "1"
