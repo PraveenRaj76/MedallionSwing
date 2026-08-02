@@ -23,6 +23,23 @@ cd "C:\Users\prdhan\OneDrive - ASSA ABLOY Group\Desktop\Medallion Swing\medallio
 
 ---
 
+## Streamlit Community Cloud (recommended free, no credit card)
+
+**Deploy failed on Python 3.14?** Cloud ignores `runtime.txt`. You must set Python in the UI.
+
+1. Push latest `requirements.txt` to GitHub  
+2. In [share.streamlit.io](https://share.streamlit.io) → your app → **Settings** (or delete & redeploy)  
+3. **Advanced settings → Python version → 3.12** (or 3.11) — **not 3.14**  
+4. Main file: `app.py` · Reboot / Redeploy  
+5. Secrets (optional):
+
+```toml
+MEDALLION_MARKET_MODE = "live"
+MEDALLION_SSL_VERIFY = "1"
+```
+
+---
+
 ## Part A — Deploy freely on Render (step by step)
 
 ### What you need

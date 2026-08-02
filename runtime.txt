@@ -1,1 +1,4 @@
-3.11.9
+# NOTE: Streamlit Community Cloud IGNORES this file for Python version.
+# On share.streamlit.io → App settings / Redeploy → Advanced → set Python to 3.12
+# This file is kept for Render / other hosts.
+python-3.12
