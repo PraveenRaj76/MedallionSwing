@@ -9,7 +9,8 @@ import html
 import logging
 import os
 import re
-from typing import Any, List, Tuple
+import time
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -19,6 +20,10 @@ from plotly.subplots import make_subplots
 
 import data_pipeline as pipeline
 import database_engine as db
+import factor_engine as factors
+import nse_data_provider as nse
+import prod_runtime
+import refresh_worker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -125,6 +130,12 @@ def init_session_state() -> None:
         "sync_result": None,
         "order_flash": None,
         "selected_ticker": None,
+        "best_stock_ranked": None,
+        "best_stock_why": None,
+        "best_stock_ticker": None,
+        "best_stock_card": None,
+        "fund_eta": None,
+        "daily_refresh_running": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -149,8 +160,23 @@ def logout_user() -> None:
     init_session_state()
 
 
-def run_signal_sync(user_id: int) -> None:
-    st.session_state.sync_result = pipeline.sync_user_and_screener_data(user_id)
+def run_signal_sync(user_id: int, force: bool = False, fast: bool = False) -> None:
+    st.session_state.sync_result = pipeline.sync_user_and_screener_data(
+        user_id, force=force, fast=fast
+    )
+
+
+def run_light_validate(user_id: int) -> None:
+    """Nav path: mark positions only — never block on full Yahoo universe pull."""
+    clearances = pipeline.validate_active_signals(user_id)
+    prev = st.session_state.get("sync_result") or {}
+    st.session_state.sync_result = {
+        **prev,
+        "clearances": clearances,
+        "skipped_heavy_sync": True,
+        "message": prev.get("message")
+        or f"Validated active signals ({len(clearances)} clearance(s)).",
+    }
 
 
 def execute_algorithmic_buy(
@@ -180,6 +206,18 @@ def execute_algorithmic_buy(
     return ok, message
 
 
+def _pause_screener_background_load() -> None:
+    """Explicit Pause only — does not run when navigating to other pages."""
+    st.session_state.daily_refresh_running = False
+    refresh_worker.stop_worker(pause=True)
+
+
+def _start_screener_background_load(user_id: int) -> None:
+    """Start continuous background load until swing universe is ready (survives page changes)."""
+    st.session_state.daily_refresh_running = True
+    refresh_worker.start_worker(user_id=user_id, batch_size=12)
+
+
 def render_top_navbar(nav: str, username: str) -> None:
     active = "ms-navbar__link--active"
     render_html(
@@ -193,20 +231,21 @@ def render_top_navbar(nav: str, username: str) -> None:
     with c1:
         if st.button("Screener", use_container_width=True, key="nav_screener"):
             st.session_state.nav_page = PAGE_SCREENER
-            run_signal_sync(int(st.session_state.user_id))
+            run_light_validate(int(st.session_state.user_id))
             st.rerun()
     with c2:
         if st.button("Search Profile", use_container_width=True, key="nav_search"):
             st.session_state.nav_page = PAGE_SEARCH
-            run_signal_sync(int(st.session_state.user_id))
+            run_light_validate(int(st.session_state.user_id))
             st.rerun()
     with c3:
         if st.button("Forward-Test", use_container_width=True, key="nav_val"):
             st.session_state.nav_page = PAGE_VALIDATION
-            run_signal_sync(int(st.session_state.user_id))
+            run_light_validate(int(st.session_state.user_id))
             st.rerun()
     with c4:
         if st.button("Log Out", use_container_width=True, key="nav_logout"):
+            _pause_screener_background_load()
             logout_user()
             st.rerun()
 
@@ -246,7 +285,7 @@ def render_login_gate() -> None:
         st.session_state.logged_in = True
         st.session_state.user_id = user_id
         st.session_state.username = username.strip()
-        run_signal_sync(int(user_id))
+        st.session_state.sync_result = None  # trigger fast bootstrap after rerun
         st.success(message)
         st.rerun()
 
@@ -257,19 +296,90 @@ def render_login_gate() -> None:
     st.session_state.logged_in = True
     st.session_state.user_id = user_id
     st.session_state.username = username.strip()
-    run_signal_sync(int(user_id))
+    st.session_state.sync_result = None  # trigger fast bootstrap after rerun
     st.success(message)
     st.rerun()
 
 
+def _chart_layout(fig: go.Figure, height: int = 320) -> go.Figure:
+    fig.update_layout(
+        height=height,
+        template="plotly_white",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#f8fafc",
+        font=dict(family="Plus Jakarta Sans, sans-serif", color="#0f172a"),
+        margin=dict(l=40, r=20, t=40, b=30),
+        legend=dict(orientation="h", y=1.12),
+    )
+    return fig
+
+
+def create_price_sma_chart(df_price: pd.DataFrame, ticker: str) -> go.Figure:
+    close_prices = df_price["close"].to_numpy(dtype=float)
+    dates_full = df_price["date"]
+    sma_200_values = pipeline.compute_sma(close_prices, 200)
+    dates_sma_200 = dates_full.iloc[199:] if len(close_prices) >= 200 else dates_full[:0]
+    sma_50_values = pipeline.compute_sma(close_prices, 50)
+    dates_sma_50 = dates_full.iloc[49:] if len(close_prices) >= 50 else dates_full[:0]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(x=dates_full, y=close_prices, name="Close", line=dict(color="#2563eb", width=2))
+    )
+    if len(sma_50_values):
+        fig.add_trace(
+            go.Scatter(
+                x=dates_sma_50, y=sma_50_values, name="50 SMA",
+                line=dict(color="#f59e0b", width=1.5, dash="dot"),
+            )
+        )
+    if len(sma_200_values):
+        fig.add_trace(
+            go.Scatter(
+                x=dates_sma_200, y=sma_200_values, name="200 SMA",
+                line=dict(color="#dc2626", width=2, dash="dash"),
+            )
+        )
+    fig.update_layout(title=f"{ticker} — Price & Moving Averages")
+    return _chart_layout(fig, 360)
+
+
+def create_volume_chart(df_price: pd.DataFrame, ticker: str) -> go.Figure:
+    dates_full = df_price["date"]
+    colors = [
+        "#059669" if df_price["close"].iloc[i] >= df_price["open"].iloc[i] else "#dc2626"
+        for i in range(len(df_price))
+    ]
+    fig = go.Figure(
+        go.Bar(x=dates_full, y=df_price["volume"], marker=dict(color=colors), name="Volume")
+    )
+    fig.update_layout(title=f"{ticker} — Volume")
+    return _chart_layout(fig, 260)
+
+
+def create_rsi_chart(df_price: pd.DataFrame, ticker: str) -> go.Figure:
+    close_prices = df_price["close"].to_numpy(dtype=float)
+    dates_full = df_price["date"]
+    rsi_idx, rsi_values = pipeline.compute_rsi_series(close_prices, 14)
+    dates_rsi = dates_full.iloc[rsi_idx] if len(rsi_idx) else dates_full[:0]
+    fig = go.Figure()
+    if len(rsi_values):
+        fig.add_trace(
+            go.Scatter(x=dates_rsi, y=rsi_values, name="RSI(14)", line=dict(color="#64748b", width=2))
+        )
+    fig.add_hline(y=65, line_dash="dash", line_color="#dc2626", annotation_text="65 lock")
+    fig.add_hline(y=45, line_dash="dot", line_color="#94a3b8")
+    fig.update_layout(title=f"{ticker} — RSI (14)", yaxis=dict(range=[0, 100]))
+    return _chart_layout(fig, 280)
+
+
 def create_technical_chart(df_price: pd.DataFrame, ticker: str) -> go.Figure:
+    """Legacy combined chart (kept for E2E / smoke). Prefer panel charts in Search Profile."""
     close_prices = df_price["close"].to_numpy(dtype=float)
     dates_full = df_price["date"]
     sma_200_values = pipeline.compute_sma(close_prices, 200)
     dates_sma_200 = dates_full.iloc[199:] if len(close_prices) >= 200 else dates_full[:0]
     rsi_idx, rsi_values = pipeline.compute_rsi_series(close_prices, 14)
     dates_rsi = dates_full.iloc[rsi_idx] if len(rsi_idx) else dates_full[:0]
-
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
         row_heights=[0.5, 0.25, 0.25],
@@ -301,7 +411,6 @@ def create_technical_chart(df_price: pd.DataFrame, ticker: str) -> go.Figure:
             row=3, col=1,
         )
         fig.add_hline(y=65, line_dash="dash", line_color="#dc2626", row=3, col=1)
-
     fig.update_layout(
         height=760, template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="#f8fafc", font=dict(family="Plus Jakarta Sans, sans-serif", color="#0f172a"),
@@ -310,10 +419,70 @@ def create_technical_chart(df_price: pd.DataFrame, ticker: str) -> go.Figure:
     return fig
 
 
+def _render_checklist_block(title: str, block: dict) -> None:
+    st.markdown(f'<div class="ms-section"><h3 class="ms-title">{title}</h3></div>', unsafe_allow_html=True)
+    rows = []
+    for item in block["items"]:
+        mark = "PASS" if item["passed"] else "FAIL"
+        rows.append([
+            item["name"],
+            item["value"],
+            f"{item['marks']:.1f}/{item['max_marks']:.0f}",
+            mark,
+            item["note"],
+        ])
+    render_borderless_table(
+        ["Filter", "Value", "Marks", "Status", "Why"],
+        rows,
+        height=min(80 + 36 * len(rows), 420),
+    )
+    st.caption(
+        f"**Subtotal:** {block['total_marks']:.1f} / {block['max_marks']:.0f} "
+        f"· Cleared {block['cleared']}/{block['total_filters']} filters "
+        f"· {block['pct']:.1f}%"
+    )
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Coerce None/NaN/blank to default — pandas .get(key, 0) fails when key exists as None."""
+    try:
+        if val is None:
+            return float(default)
+        if isinstance(val, float) and val != val:  # NaN
+            return float(default)
+        if val == "" or val == "—":
+            return float(default)
+        return float(val)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _fmt_num(val: Any, fmt: str = ".1f", blank: str = "—") -> str:
+    if val is None or val == "" or (isinstance(val, float) and val != val):
+        return blank
+    try:
+        return format(_safe_float(val), fmt)
+    except Exception:
+        return blank
+
+
+def _fmt_score(val: Any) -> str:
+    """Show — when fundamental score missing / zero from price-only sync."""
+    if val is None or (isinstance(val, float) and val != val):
+        return "—"
+    try:
+        n = float(val)
+        if n <= 0:
+            return "—"
+        return f"{n:.0f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
 def _render_buy_panel(user_id: int, row: pd.Series, source_page: str, prefix: str) -> None:
     ticker = str(row["ticker"]).upper()
-    close_price = float(row["close_price"])
-    atr = float(row["atr_value"])
+    close_price = _safe_float(row.get("close_price"), 0.0)
+    atr = _safe_float(row.get("atr_value"), 0.0)
     levels = pipeline.build_trade_levels(close_price, atr)
     render_html(
         "EXECUTION_TICKET",
@@ -340,46 +509,317 @@ def _render_buy_panel(user_id: int, row: pd.Series, source_page: str, prefix: st
             st.error(message)
 
 
+def _price_kind_label(kind: Any) -> str:
+    k = str(kind or "LIVE").strip().upper()
+    return {"LIVE": "Live", "LAST": "Last", "PREV_CLOSE": "Prev close"}.get(k, k or "Live")
+
+
+def _fmt_cmp_cell(row: Any) -> str:
+    px = _safe_float(row.get("close_price"), 0.0)
+    label = _price_kind_label(row.get("price_kind"))
+    return f"₹{px:,.2f} ({label})"
+
+
+def _update_fund_eta(fresult: Dict[str, Any], fcov: Dict[str, Any]) -> Dict[str, Any]:
+    """Track cumulative fill rate for a stable ETA across auto-continue batches."""
+    now = time.time()
+    meta = st.session_state.get("fund_eta") or {}
+    filled = int(fresult.get("filled") or 0)
+    if not meta.get("t0") or meta.get("verified0") is None:
+        meta = {
+            "t0": now - float(fresult.get("elapsed_sec") or 0),
+            "verified0": max(0, int(fcov.get("verified") or 0) - filled),
+        }
+    elapsed = max(now - float(meta["t0"]), 0.001)
+    verified = int((fresult.get("coverage") or fcov).get("verified") or fcov.get("verified") or 0)
+    gained = max(0, verified - int(meta["verified0"]))
+    rate_per_min = gained / elapsed * 60.0 if gained > 0 else float(fresult.get("batch_rate_per_min") or 0)
+    missing = int((fresult.get("coverage") or fcov).get("missing") or fcov.get("missing") or 0)
+    eta_min = (missing / rate_per_min) if rate_per_min > 0 and missing > 0 else None
+    meta.update(
+        {
+            "rate_per_min": round(rate_per_min, 2),
+            "eta_minutes": round(eta_min, 1) if eta_min is not None else None,
+            "last_message": fresult.get("message"),
+            "verified": verified,
+            "missing": missing,
+            "total": int((fresult.get("coverage") or fcov).get("total") or fcov.get("total") or 0),
+        }
+    )
+    if missing <= 0:
+        meta = {"t0": None, "verified0": None, "eta_minutes": 0, "rate_per_min": rate_per_min,
+                "verified": verified, "missing": 0, "total": meta.get("total"),
+                "last_message": fresult.get("message")}
+    st.session_state.fund_eta = meta
+    return meta
+
+
+def _fmt_eta(eta_min: Any) -> str:
+    if eta_min is None:
+        return ""
+    try:
+        eta = float(eta_min)
+    except (TypeError, ValueError):
+        return ""
+    if eta <= 0:
+        return ""
+    hrs = int(eta // 60)
+    mins = int(round(eta % 60))
+    if hrs:
+        return f" · ETA ~{hrs}h {mins}m"
+    return f" · ETA ~{mins} min"
+
+
+def _render_daily_progress(status: Dict[str, Any]) -> None:
+    target = max(int(status.get("target") or nse.UNIVERSE_TARGET_HINT), 1)
+    complete = int(status.get("complete") or 0)
+    missing = int(status.get("missing") or max(0, target - complete))
+    failed = int(status.get("failed") or 0)
+    eta_bit = _fmt_eta(status.get("eta_minutes"))
+
+    st.markdown(f"##### {nse.universe_label()} data refresh")
+    st.markdown(
+        f"<div style='font-size:1.75rem;font-weight:800;margin:0.2rem 0 0.6rem 0;'>"
+        f"Ready <span style='color:#2563eb'>{complete}</span> / {target}</div>",
+        unsafe_allow_html=True,
+    )
+    st.progress(
+        min(1.0, complete / target),
+        text=f"Swing stocks fully loaded {complete} / {target}",
+    )
+    st.caption(
+        "Counts **+1 only when** price + fundamentals + technicals + checklist fields are all present for a stock."
+    )
+
+    if not status.get("is_today"):
+        st.warning(
+            f"New day (**{status.get('today')}** IST) — click **Refresh**. "
+            "Yesterday's table stays hidden."
+        )
+    elif complete >= target:
+        st.success(f"Today (**{status.get('as_of')}**) — **{complete} / {target}** stocks ready.")
+    elif status.get("load_finished") and failed > 0:
+        st.warning(
+            f"Finished with gaps — **{complete} / {target}** ready, **{failed}** could not load after retries "
+            "(listed at the bottom)."
+        )
+    elif status.get("status") == "paused":
+        st.info(
+            f"Paused at **{complete} / {target}** ready · **{missing}** remaining. "
+            "Click **Resume load** once — it keeps running in the background while you use Search / Forward-Test."
+        )
+    elif status.get("running") or status.get("status") == "running":
+        st.info(
+            f"Loading in background… **{complete} / {target}** ready · **{missing}** remaining"
+            f"{eta_bit}. Navigate freely — load continues until complete."
+        )
+    elif missing > 0:
+        st.warning(
+            f"Incomplete: **{complete} / {target}**. Click **Refresh** to reset and reload."
+        )
+    msg = status.get("message") or ""
+    if msg:
+        st.caption(msg)
+
+
+def _render_failed_loads(status: Dict[str, Any]) -> None:
+    failures = status.get("failures") or []
+    if not failures:
+        return
+    st.markdown(
+        '<div class="ms-section"><h3 class="ms-title">Not loaded (after retries)</h3>'
+        '<p class="ms-muted">Still missing core price / fund / tech fields after retries. '
+        "Debt & interest coverage alone no longer block a name. "
+        "Force re-refresh later to try again.</p></div>",
+        unsafe_allow_html=True,
+    )
+    rows = [[f["ticker"], f.get("attempts", "—"), str(f.get("error") or "—")[:80]] for f in failures]
+    render_borderless_table(["Ticker", "Attempts", "Last error"], rows, height=min(80 + 36 * len(rows), 280))
+
+
 def render_screener(user_id: int) -> None:
     render_html("BANNER")
     if st.session_state.get("order_flash"):
         st.success(st.session_state.order_flash)
 
+    status = pipeline.daily_load_status()
+    target = int(status.get("target") or nse.UNIVERSE_TARGET_HINT)
+    complete = int(status.get("complete") or 0)
+    day_done = bool(status.get("is_today") and complete >= target)
+
+    if day_done and status.get("status") not in {"complete", "failed"}:
+        db.set_screener_refresh_state(
+            status="complete",
+            message=f"{nse.universe_label()} ready — {complete}/{target}.",
+        )
+        status = pipeline.daily_load_status()
+        day_done = True
+
     st.markdown(
         '<div class="ms-section"><h2 class="ms-title">Smart Screener</h2>'
-        '<p class="ms-muted">Live NSE universe · fundamentals from Screener.in · buys track exactly 1 share.</p></div>',
+        f'<p class="ms-muted">One Refresh loads <b>{nse.universe_label()}</b> '
+        "(~200 swing names). Progress counts a stock only when "
+        "price, fundamentals, technicals and checklist fields are all ready. Qty = 1.</p></div>",
         unsafe_allow_html=True,
     )
 
-    df = db.get_leaderboard(limit=100)
+    _render_daily_progress(status)
+
+    pending_n = int(status.get("pending") or 0)
+    worker_alive = refresh_worker.is_worker_alive()
+    # If DB says running but worker died (restart), resume automatically
+    if (
+        not worker_alive
+        and status.get("status") == "running"
+        and pending_n > 0
+        and status.get("is_today")
+        and not day_done
+    ):
+        _start_screener_background_load(user_id)
+        worker_alive = refresh_worker.is_worker_alive()
+    if worker_alive:
+        st.session_state.daily_refresh_running = True
+
+    # Needs Resume only when work remains and no background worker is active
+    is_paused = (
+        not worker_alive
+        and pending_n > 0
+        and status.get("is_today")
+        and not day_done
+        and status.get("status") in {"running", "paused", "idle", "failed"}
+    )
+
+    if worker_alive and pending_n > 0 and status.get("is_today"):
+        if st.button("Pause load", use_container_width=True, key="screener_pause_load"):
+            _pause_screener_background_load()
+            st.rerun()
+    elif is_paused and pending_n > 0 and status.get("is_today"):
+        r1, r2 = st.columns(2)
+        with r1:
+            if st.button("Resume load", type="primary", use_container_width=True, key="screener_resume_load"):
+                db.set_screener_refresh_state(
+                    status="running",
+                    message=f"Resumed in background — {complete}/{target} ready…",
+                )
+                _start_screener_background_load(user_id)
+                st.rerun()
+        with r2:
+            if st.button("Pause / stay idle", use_container_width=True, key="screener_stay_paused"):
+                _pause_screener_background_load()
+                st.rerun()
+
+    if not day_done and not (status.get("load_finished") and complete < target):
+        # Don't offer wipe-Refresh while a paused progressive load exists — use Resume or Force.
+        show_refresh = (
+            not worker_alive
+            and not st.session_state.get("daily_refresh_running")
+            and complete == 0
+            and int(status.get("pending") or 0) == 0
+        ) or (not status.get("is_today"))
+        if show_refresh:
+            if st.button("Refresh", type="primary", use_container_width=True, key="screener_daily_refresh"):
+                with st.spinner(
+                    f"Resetting to 0 / {target} and starting {nse.universe_label()} refresh…"
+                ):
+                    started = pipeline.begin_daily_refresh(user_id=user_id)
+                    st.session_state.sync_result = started
+                    st.session_state.fund_eta = None
+                    _start_screener_background_load(user_id)
+                st.rerun()
+        elif (
+            not worker_alive
+            and not st.session_state.get("daily_refresh_running")
+            and status.get("is_today")
+            and complete == 0
+            and db.leaderboard_count() == 0
+        ):
+            if st.button("Refresh", type="primary", use_container_width=True, key="screener_daily_refresh_empty"):
+                with st.spinner(f"Starting {nse.universe_label()} refresh…"):
+                    started = pipeline.begin_daily_refresh(user_id=user_id)
+                    st.session_state.sync_result = started
+                    _start_screener_background_load(user_id)
+                st.rerun()
+    elif day_done:
+        st.caption("Refresh hidden — today's swing-universe load is complete.")
+        with st.expander("Force re-refresh (wipe today and reload)", expanded=False):
+            if st.button("Force re-refresh now", type="secondary", use_container_width=True, key="screener_force_refresh"):
+                with st.spinner(f"Force reset — clearing to 0 / {target}…"):
+                    started = pipeline.begin_daily_refresh(user_id=user_id)
+                    st.session_state.sync_result = started
+                    st.session_state.fund_eta = None
+                    _start_screener_background_load(user_id)
+                st.rerun()
+    else:
+        # Finished with some failures — allow force retry
+        with st.expander("Force re-refresh (retry including failed names)", expanded=False):
+            if st.button("Force re-refresh now", type="secondary", use_container_width=True, key="screener_force_refresh2"):
+                with st.spinner(f"Force reset — clearing to 0 / {target}…"):
+                    started = pipeline.begin_daily_refresh(user_id=user_id)
+                    st.session_state.sync_result = started
+                    _start_screener_background_load(user_id)
+                st.rerun()
+
+    status = pipeline.daily_load_status()
+    worker_alive = refresh_worker.is_worker_alive()
+    still_loading = bool(
+        worker_alive
+        and status.get("is_today")
+        and int(status.get("pending") or 0) > 0
+    )
+
+    if worker_alive and int(status.get("pending") or 0) == 0:
+        st.session_state.daily_refresh_running = False
+
+    if still_loading:
+        complete_now = int(status.get("complete") or 0)
+        target_now = int(status.get("target") or nse.UNIVERSE_TARGET_HINT)
+        st.caption(
+            f"Background load active… {complete_now} / {target_now} ready"
+            f"{_fmt_eta(status.get('eta_minutes'))}. Safe to use Search / Forward-Test."
+        )
+
+    status = pipeline.daily_load_status()
+
+    df = pipeline.filter_display_ready(db.get_leaderboard(limit=1000))
     if df is None or df.empty:
-        with st.spinner("Loading live NSE screener universe (first sync can take 1–3 minutes)…"):
-            st.session_state.sync_result = pipeline.sync_user_and_screener_data(user_id, force=True)
-        df = db.get_leaderboard(limit=100)
-    if df is None or df.empty:
-        st.error("Live NSE screener is empty right now. Click refresh on Forward-Test or try again shortly.")
+        if status.get("running") or still_loading or refresh_worker.is_worker_alive():
+            st.info(
+                f"Table grows as each stock finishes. "
+                f"Currently **{status.get('complete', 0)} / {status.get('target', nse.UNIVERSE_TARGET_HINT)}** ready."
+            )
+        elif not status.get("is_today"):
+            st.info("No data for today yet. Click **Refresh** to begin.")
+        else:
+            st.warning("No fully ready stocks yet.")
+        _render_failed_loads(status)
+        if still_loading:
+            time.sleep(0.45)
+            st.rerun()
         return
 
-    display = df.copy()
-    display["composite_score"] = pd.to_numeric(display["composite_score"], errors="coerce")
-    display = display.dropna(subset=["composite_score"]).sort_values("composite_score", ascending=False)
-
+    display = df
     rows = []
     for _, r in display.iterrows():
         rows.append([
             r["ticker"],
             r["company_name"],
-            r["sector"],
-            f"{float(r['fundamental_score']):.0f}",
-            f"{float(r['technical_score']):.0f}",
-            f"{float(r['composite_score']):.0f}",
-            f"₹{float(r['close_price']):,.2f}",
-            "Yes" if int(r.get("is_buyable", 0)) else "No",
+            r["sector"] if pd.notna(r.get("sector")) and str(r.get("sector")).strip() not in {"", "—", "nan"} else "—",
+            _fmt_score(r.get("fundamental_score")),
+            _fmt_score(r.get("technical_score")),
+            _fmt_score(r.get("composite_score")),
+            _fmt_cmp_cell(r),
+            str(r.get("last_updated") or "—")[-8:] if r.get("last_updated") else "—",
+            "Yes" if int(_safe_float(r.get("is_buyable"), 0)) else "No",
         ])
     render_borderless_table(
-        ["Ticker", "Company", "Sector", "Fund.", "Tech.", "Score", "CMP", "Buyable"],
+        ["Ticker", "Company", "Sector", "Fund.", "Tech.", "Score", "CMP", "Updated", "Buyable"],
         rows,
-        height=340,
+        height=420,
+    )
+    st.caption(
+        f"Showing **{len(rows)}** ready stocks "
+        f"(**{status.get('complete')} / {status.get('target')}**). "
+        "Each row has full price + fund + tech + checklist data."
     )
 
     tickers = display["ticker"].astype(str).tolist()
@@ -390,23 +830,43 @@ def render_screener(user_id: int) -> None:
     st.session_state.selected_ticker = selected
     row = display[display["ticker"] == selected].iloc[0]
 
-    close_price = float(row["close_price"])
-    levels = pipeline.build_trade_levels(close_price, float(row["atr_value"]))
+    close_price = _safe_float(row.get("close_price"), 0.0)
+    levels = pipeline.build_trade_levels(close_price, _safe_float(row.get("atr_value"), 0.0))
     is_buyable, reason = pipeline.check_buyability(row)
     badge = extract_html_block("BADGE_BUY" if is_buyable else "BADGE_HOLD")
     render_html(
         "ASSET_HEADER",
-        company_name=row.get("company_name", selected),
+        company_name=row.get("company_name", selected) or selected,
         ticker=selected,
-        description=row.get("description", ""),
-        sector=row.get("sector", "—"),
-        industry=row.get("industry", "—"),
+        description=row.get("description", "") or "",
+        sector=row.get("sector", "—") or "—",
+        industry=row.get("industry", "—") or "—",
         decision_badge=badge,
     )
     if not is_buyable and "OVEREXTENDED" in reason:
         st.markdown(f'<div class="ms-warning">{reason}</div>', unsafe_allow_html=True)
     else:
         st.caption(reason)
+
+    price_note = _price_kind_label(row.get("price_kind"))
+    src = str(row.get("price_source") or "").strip()
+    src_bit = f" · {src}" if src else ""
+    prev = row.get("prev_close")
+    prev_bit = (
+        f" · prev close ₹{_safe_float(prev):,.2f}"
+        if prev not in (None, "") and _safe_float(prev) > 0
+        else ""
+    )
+    st.caption(f"CMP type: **{price_note}**{src_bit}{prev_bit}")
+
+    # Sector pack + Quality / Value / Timing
+    card = factors.full_factor_scorecard(row)
+    pack = card.get("sector_pack", "general")
+    qvt = card.get("qvt") or {}
+    st.caption(
+        f"Checklist pack: **{pack}** · "
+        f"Quality {qvt.get('quality', 0):.0f} · Value {qvt.get('value', 0):.0f} · Timing {qvt.get('timing', 0):.0f}"
+    )
 
     render_html(
         "TRADE_PARAMS",
@@ -416,25 +876,101 @@ def render_screener(user_id: int) -> None:
         target=f"{levels['target']:,.2f}",
         rrr=f"{levels['rrr']:.2f}",
     )
-    sma_trend = "Above 200 SMA" if close_price > float(row.get("sma_200", 0)) else "Below 200 SMA"
+    sma200 = _safe_float(row.get("sma_200"), 0.0)
+    sma_trend = "Above 200 SMA" if close_price > sma200 else "Below 200 SMA"
     render_html(
         "REPORT_CARD",
         ticker=selected,
-        roic=f"{float(row.get('roic', 0)):.1f}",
-        net_debt_ebitda=f"{float(row.get('net_debt_ebitda', 0)):.2f}",
-        peg=f"{float(row.get('peg_ratio', 0)):.2f}",
-        interest_coverage=f"{float(row.get('interest_coverage', 0)):.1f}",
-        promoter_pledge=f"{float(row.get('promoter_pledge_pct', 0)):.1f}",
-        profit_growth=f"{float(row.get('yoy_profit_growth', 0)):.1f}",
+        roic=_fmt_num(row.get("roic"), ".1f"),
+        net_debt_ebitda=_fmt_num(row.get("net_debt_ebitda"), ".2f"),
+        peg=_fmt_num(row.get("peg_ratio"), ".2f"),
+        interest_coverage=_fmt_num(row.get("interest_coverage"), ".1f"),
+        promoter_pledge=_fmt_num(row.get("promoter_pledge_pct"), ".1f"),
+        profit_growth=_fmt_num(row.get("yoy_profit_growth"), ".1f"),
         sma_trend=sma_trend,
-        rsi=f"{float(row.get('rsi_14', 0)):.1f}",
-        delivery_pct=f"{float(row.get('delivery_pct_10d', 0)):.1f}",
-        composite_score=f"{float(row.get('composite_score', 0)):.0f}",
+        rsi=_fmt_num(row.get("rsi_14"), ".1f"),
+        delivery_pct=_fmt_num(row.get("delivery_pct_10d"), ".1f"),
+        composite_score=_fmt_num(row.get("composite_score"), ".0f"),
     )
     if is_buyable:
         _render_buy_panel(user_id, row, PAGE_SCREENER, "screen")
     else:
         st.info("Signal entry locked until trend / RSI filters clear.")
+
+    _render_failed_loads(status)
+    _render_best_stock_lab(display)
+
+    if still_loading:
+        time.sleep(0.45)
+        st.rerun()
+
+
+def _render_best_stock_lab(display: pd.DataFrame) -> None:
+    st.markdown(
+        '<div class="ms-section"><h2 class="ms-title">Best Stock Lab</h2>'
+        '<p class="ms-muted">Takes every name sharing the top 3 composite scores across Nifty, '
+        "re-ranks with an expanded fundamental + technical checklist, then explains the winner.</p></div>",
+        unsafe_allow_html=True,
+    )
+    if st.button("Find Best Stock in Top-Score Pool", type="primary", use_container_width=True, key="best_stock_run"):
+        with st.spinner(
+            "Live multi-source verify (Screener + Tickertape + Moneycontrol) "
+            "then expanded checklist — may take a few minutes…"
+        ):
+            pool = factors.select_top_score_pool(display, top_n_scores=3)
+            ranked, best_row, why = factors.rank_best_stocks(pool, live_verify=True, max_verify=12)
+            st.session_state.best_stock_ranked = ranked
+            st.session_state.best_stock_why = why
+            st.session_state.best_stock_ticker = (
+                str(best_row.get("ticker")) if best_row is not None else None
+            )
+            if best_row is not None:
+                st.session_state.best_stock_card = factors.full_factor_scorecard(best_row)
+
+    ranked = st.session_state.get("best_stock_ranked")
+    if ranked is None or (isinstance(ranked, pd.DataFrame) and ranked.empty):
+        st.caption("Click the button to analyse the current Nifty leaderboard.")
+        return
+
+    top_scores = sorted(ranked["db_composite"].unique(), reverse=True)[:3]
+    st.info(
+        f"Top score band(s): {', '.join(f'{s:.1f}' for s in top_scores)} · "
+        f"Pool size: **{len(ranked)}** stocks · Winner: **{st.session_state.get('best_stock_ticker')}**"
+    )
+    st.markdown(st.session_state.get("best_stock_why", ""))
+
+    compare_rows = []
+    for _, r in ranked.head(25).iterrows():
+        compare_rows.append([
+            r["ticker"],
+            r["company_name"][:28],
+            r["sector"][:18],
+            str(r.get("data_quality", "—")),
+            f"{float(r['db_composite']):.1f}",
+            f"{float(r['fund_marks']):.1f}",
+            f"{float(r['tech_marks']):.1f}",
+            f"{float(r['expanded_total']):.1f}",
+            f"{int(r['fund_cleared'])}/{int(r['fund_filters'])}",
+            f"{int(r['tech_cleared'])}/{int(r['tech_filters'])}",
+            "Yes" if int(r["is_buyable"]) else "No",
+        ])
+    render_borderless_table(
+        ["Ticker", "Company", "Sector", "Quality", "DB", "Fund", "Tech", "Expanded", "F-CLR", "T-CLR", "Buyable"],
+        compare_rows,
+        height=360,
+    )
+
+    card = st.session_state.get("best_stock_card")
+    if card:
+        st.markdown(
+            f'<div class="ms-section"><h3 class="ms-title">Why {html.escape(str(st.session_state.get("best_stock_ticker")))} wins</h3>'
+            f'<p class="ms-muted">Expanded total '
+            f'{card["composite_marks"]:.1f}/{card["composite_max"]:.0f} '
+            f'({card["composite_pct"]:.1f}%)</p></div>',
+            unsafe_allow_html=True,
+        )
+        _render_checklist_block("Winner — Fundamental checklist", card["fundamental"])
+        _render_checklist_block("Winner — Technical checklist", card["technical"])
 
 
 def render_search(user_id: int) -> None:
@@ -443,20 +979,54 @@ def render_search(user_id: int) -> None:
         st.success(st.session_state.order_flash)
     st.markdown(
         '<div class="ms-section"><h2 class="ms-title">Search Profile</h2>'
-        '<p class="ms-muted">Lookup a ticker. Cleared signals open at fixed Quantity = 1.</p></div>',
+        '<p class="ms-muted">Live NSE profile · fundamentals + technicals · charts with plain-English readouts · '
+        "every search pulls latest quotes independently of Screener load.</p></div>",
         unsafe_allow_html=True,
     )
-    ticker_input = st.text_input("Ticker", placeholder="TCS, RELIANCE, INFY, HDFCBANK")
+    try:
+        sstatus = pipeline.daily_load_status()
+        if sstatus.get("status") in {"paused", "running"} and int(sstatus.get("pending") or 0) > 0:
+            st.caption(
+                f"Screener load status **{sstatus.get('complete', 0)}/"
+                f"{sstatus.get('target', nse.UNIVERSE_TARGET_HINT)}** — "
+                "this Search fetch is separate and live."
+            )
+    except Exception:
+        pass
+
+    c_in, c_btn = st.columns([3, 1])
+    with c_in:
+        ticker_input = st.text_input("Ticker", placeholder="TCS, RELIANCE, INFY, HDFCBANK", key="search_ticker_input")
+    with c_btn:
+        st.write("")
+        st.write("")
+        force = st.button("Refresh latest", use_container_width=True, key="search_force_refresh")
+
     if not ticker_input:
         return
     ticker = ticker_input.strip().upper()
-    with st.spinner(f"Fetching live NSE profile for {ticker}…"):
-        row = pipeline.ensure_ticker_live(ticker, include_fundamentals=True)
+
+    # Always force live fetch on Search Profile (independent of Screener batch job)
+    with st.spinner(f"Fetching latest live NSE data for {ticker}…"):
+        row = pipeline.ensure_ticker_live(ticker, include_fundamentals=True, force_refresh=True)
+        history = pipeline.generate_price_history(ticker, 0, 250)
+
     if row is None:
-        st.error(f"No live NSE listing for '{ticker}'. Try the NSE symbol (e.g. TCS, RELIANCE).")
+        st.error(
+            f"Could not load live data for '{ticker}'. "
+            f"Yahoo/Screener/Tickertape may be blocked on this network. "
+            f"In PowerShell run: `$env:MEDALLION_SSL_VERIFY='0'` then restart Streamlit, "
+            f"or run `python sync_nifty500_local.py --clear`."
+        )
         return
 
+    if force:
+        st.success(f"Refreshed live quotes & fundamentals for {ticker}.")
+
     close_price = float(row["close_price"])
+    if history is None or history.empty:
+        history = pipeline.generate_price_history(ticker, close_price, 250)
+
     is_buyable, reason = pipeline.check_buyability(row)
     badge = extract_html_block("BADGE_BUY" if is_buyable else "BADGE_HOLD")
     render_html(
@@ -475,18 +1045,91 @@ def render_search(user_id: int) -> None:
             st.warning(reason)
     else:
         st.success(reason)
-        _render_buy_panel(user_id, row, PAGE_SEARCH, "search")
 
+    # Snapshot metrics (Screener-style)
+    snap = factors.profile_snapshot(row)
     st.markdown(
-        '<div class="ms-section"><h3 class="ms-title">Technical Chart</h3>'
-        '<p class="ms-muted">Live NSE daily OHLC (Yahoo/NSE feed)</p></div>',
+        '<div class="ms-section"><h3 class="ms-title">Stock Snapshot (live)</h3></div>',
         unsafe_allow_html=True,
     )
-    history = pipeline.generate_price_history(ticker, close_price, 250)
+    snap_rows = [[k, v] for k, v in snap.items()]
+    # render in two columns of kv via table
+    mid = (len(snap_rows) + 1) // 2
+    left, right = st.columns(2)
+    with left:
+        render_borderless_table(["Metric", "Value"], snap_rows[:mid], height=320)
+    with right:
+        render_borderless_table(["Metric", "Value"], snap_rows[mid:], height=320)
+
+    levels = pipeline.build_trade_levels(close_price, float(row.get("atr_value", 0) or 0))
+    render_html(
+        "TRADE_PARAMS",
+        ticker=ticker,
+        cmp=f"{close_price:,.2f}",
+        stop_loss=f"{levels['stop_loss']:,.2f}",
+        target=f"{levels['target']:,.2f}",
+        rrr=f"{levels['rrr']:.2f}",
+    )
+
+    # Multi-source consensus table (Screener + Tickertape + Moneycontrol)
+    report = row.get("fundamentals_report") if hasattr(row, "get") else None
+    quality = str(row.get("data_quality") or "UNVERIFIED")
+    sources = row.get("fundamentals_sources") or []
+    st.markdown(
+        f'<div class="ms-section"><h3 class="ms-title">Multi-source verification</h3>'
+        f'<p class="ms-muted">Quality: <strong>{html.escape(quality)}</strong> · '
+        f'Sources: {html.escape(", ".join(sources) if sources else "none")}. '
+        f"Metrics enter scoring only after Screener + Tickertape + Moneycontrol consensus.</p></div>",
+        unsafe_allow_html=True,
+    )
+    if report:
+        import multi_source_data as msd
+
+        cmp_rows = msd.format_source_comparison(report)
+        render_borderless_table(
+            ["Metric", "Screener", "Tickertape", "Moneycontrol", "Consensus", "Status"],
+            cmp_rows,
+            height=280,
+        )
+    elif quality == "UNVERIFIED":
+        st.warning(
+            "Fundamentals not verified yet. Click **Refresh latest** to pull Screener + "
+            "Tickertape + Moneycontrol and block placeholder values."
+        )
+
+    card = factors.full_factor_scorecard(row, history)
+    st.markdown(
+        f'<div class="ms-section"><h3 class="ms-title">Filter Scorecard</h3>'
+        f'<p class="ms-muted">Expanded checklist total '
+        f'<strong>{card["composite_marks"]:.1f}/{card["composite_max"]:.0f}</strong> '
+        f'({card["composite_pct"]:.1f}%) · data quality {html.escape(quality)}</p></div>',
+        unsafe_allow_html=True,
+    )
+    _render_checklist_block("Fundamental filters (value → marks)", card["fundamental"])
+    _render_checklist_block("Technical filters (value → marks)", card["technical"])
+
+    if is_buyable:
+        _render_buy_panel(user_id, row, PAGE_SEARCH, "search")
+    else:
+        st.info("Signal entry locked until trend / RSI filters clear.")
+
+    # Charts + narratives
+    narratives = factors.chart_narratives(row, history if history is not None else pd.DataFrame())
+    st.markdown(
+        '<div class="ms-section"><h3 class="ms-title">Technical Charts + Readouts</h3>'
+        '<p class="ms-muted">Each panel is followed by a short summary of what the market is saying.</p></div>',
+        unsafe_allow_html=True,
+    )
     if history is None or history.empty:
         st.warning("Chart history unavailable right now.")
     else:
-        st.plotly_chart(create_technical_chart(history, ticker), use_container_width=True)
+        st.plotly_chart(create_price_sma_chart(history, ticker), use_container_width=True)
+        st.info(narratives["price_sma"])
+        st.plotly_chart(create_volume_chart(history, ticker), use_container_width=True)
+        st.info(narratives["volume"])
+        st.plotly_chart(create_rsi_chart(history, ticker), use_container_width=True)
+        st.info(narratives["rsi"])
+        st.caption(narratives["atr_note"])
 
 
 def render_validation(user_id: int) -> None:
@@ -502,90 +1145,120 @@ def render_validation(user_id: int) -> None:
     scorecard = pipeline.compute_forward_test_scorecard(user_id)
 
     st.markdown(
-        '<div class="ms-section"><h3 class="ms-title">Global Strategy Diagnostic Scorecard</h3></div>',
+        '<div class="ms-section"><h3 class="ms-title">Forward-Test Command Center</h3>'
+        '<p class="ms-muted">Track win rate, expectancy, holding horizon and velocity — '
+        "this is where checklist conviction is proven.</p></div>",
         unsafe_allow_html=True,
     )
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         render_html(
             "METRIC_TILE",
-            label="Total Signals Tracked",
+            label="Closed Tests",
             value=str(scorecard["total_signals_tracked"]),
             value_color="#0f172a",
-            subtext="Closed forward-tests",
+            subtext=f"Open now: {scorecard.get('open_signals', 0)}",
         )
     with c2:
         render_html(
             "METRIC_TILE",
-            label="Strategy Win Rate",
+            label="Win Rate",
             value=f"{scorecard['win_rate_pct']:.1f}%",
             value_color="#059669",
-            subtext="Successful / Total",
+            subtext=f"{scorecard.get('successful_trades', 0)} success / {scorecard.get('bad_trades', 0)} bad",
         )
     with c3:
         rupee = scorecard["total_realized_rupee_return"]
         render_html(
             "METRIC_TILE",
-            label="Total Realized Absolute ₹ Return",
+            label="Realized ₹ P&L",
             value=f"₹{rupee:,.2f}",
             value_color="#059669" if rupee >= 0 else "#dc2626",
-            subtext="Sum of 1-share P&L",
+            subtext=f"Expectancy ₹{scorecard.get('expectancy_rupee', 0):,.2f}/trade",
+        )
+    with c4:
+        hold = scorecard.get("avg_hold_days")
+        render_html(
+            "METRIC_TILE",
+            label="Avg Hold Horizon",
+            value=("—" if hold is None else f"{hold:.1f}d"),
+            value_color="#0f172a",
+            subtext="Entry → exit days",
         )
 
-    if st.button("Refresh Quotes & Validate Signals", use_container_width=True, key="force_validate"):
-        with st.spinner("Force-refreshing live NSE quotes…"):
-            st.session_state.sync_result = pipeline.sync_user_and_screener_data(user_id, force=True)
+    vel = scorecard.get("velocity_buckets") or {}
+    st.caption(
+        f"Velocity mix — Fast: **{vel.get('FAST', 0)}** · Normal: **{vel.get('NORMAL', 0)}** · "
+        f"Slow: **{vel.get('SLOW', 0)}** · Other: **{vel.get('OTHER', 0)}**"
+    )
+    buckets = scorecard.get("return_buckets") or {}
+    if scorecard["total_signals_tracked"] > 0:
+        st.caption(
+            f"Return terciles — Higher: **{buckets.get('high_return', 0)}** · "
+            f"Mid: **{buckets.get('mid_return', 0)}** · Lower: **{buckets.get('low_return', 0)}** "
+            "(basis for future score-bucket win-rate once entry scores are stored)."
+        )
+
+    if st.button("Refresh", type="primary", use_container_width=True, key="force_validate"):
+        with st.spinner("Validate open signals against latest prices…"):
+            st.session_state.sync_result = pipeline.refresh_verified_live(user_id=user_id)
         st.rerun()
 
     left, right = st.columns(2)
     with left:
-        st.markdown('<h3 class="ms-title">Active Signals Monitor</h3>', unsafe_allow_html=True)
+        st.markdown('<h3 class="ms-title">Active Signals</h3>', unsafe_allow_html=True)
         positions = db.get_active_positions(user_id)
         if positions is None or positions.empty:
             st.caption("No active signals.")
         else:
-            positions = positions[positions["user_id"] == user_id]
+            positions = positions[positions["user_id"] == user_id] if "user_id" in positions.columns else positions
             rows = []
             for _, p in positions.iterrows():
+                entry = float(p["entry_price"])
+                mark = float(p["current_price"] or entry)
+                stop = float(p["stop_loss"])
+                tgt = float(p["target"])
+                # rough progress to target / risk
+                risk = max(entry - stop, 1e-6)
+                reward_span = max(tgt - entry, 1e-6)
+                prog = max(0.0, min(1.0, (mark - entry) / reward_span)) if mark >= entry else 0.0
                 rows.append([
                     p["ticker"],
-                    f"₹{float(p['entry_price']):,.2f}",
-                    f"₹{float(p['current_price'] or p['entry_price']):,.2f}",
-                    f"₹{float(p['stop_loss']):,.2f}",
-                    f"₹{float(p['target']):,.2f}",
-                    int(p["quantity"]),
+                    f"₹{entry:,.2f}",
+                    f"₹{mark:,.2f}",
+                    f"₹{stop:,.2f}",
+                    f"₹{tgt:,.2f}",
+                    f"{prog * 100:.0f}%",
                     f"₹{float(p['unrealized_pnl'] or 0):,.2f}",
                 ])
             render_borderless_table(
-                ["Ticker", "Entry", "Mark", "Stop", "Target", "Qty", "uPnL"],
+                ["Ticker", "Entry", "Mark", "Stop", "Target", "To-target", "uPnL"],
                 rows,
-                height=280,
+                height=300,
             )
 
     with right:
-        st.markdown('<h3 class="ms-title">Closed Signal Results</h3>', unsafe_allow_html=True)
+        st.markdown('<h3 class="ms-title">Closed Results</h3>', unsafe_allow_html=True)
         trades = scorecard.get("trades") or []
         if not trades:
-            st.caption("No completed forward-tests yet.")
+            st.caption("No completed forward-tests yet — take Screener buys to build your real success ratio.")
         else:
             rows = []
             for t in trades:
-                badge = t["exit_status"]
                 rows.append([
                     t["ticker"],
-                    badge,
+                    t["exit_status"],
                     f"₹{t['absolute_delta']:,.2f}",
                     f"{t['pct_return']:.2f}%",
                     t["velocity_label"],
                 ])
             render_borderless_table(
-                ["Ticker", "Classification", "Abs Δ ₹", "% Return", "Velocity"],
+                ["Ticker", "Result", "Abs Δ ₹", "% Return", "Velocity"],
                 rows,
-                height=280,
+                height=300,
             )
 
-            # Detail capsules for first few trades
-            st.markdown('<div class="ms-section"><h3 class="ms-title">Deep-Dive Metrics</h3></div>', unsafe_allow_html=True)
+            st.markdown('<div class="ms-section"><h3 class="ms-title">Trade Deep-Dive</h3></div>', unsafe_allow_html=True)
             for t in trades[:8]:
                 status = str(t["exit_status"]).upper()
                 badge_html = (
@@ -622,6 +1295,8 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="collapsed",
     )
+    runtime = prod_runtime.configure_runtime()
+    prod_runtime.maybe_restore_seed_db(db.DATABASE_PATH)
     db.init_database()
     init_session_state()
     inject_theme()
@@ -631,18 +1306,28 @@ def main() -> None:
         return
 
     user_id = int(st.session_state.user_id)
+    # After login: never auto-fill. Only validate open signals if DB already has rows.
     if st.session_state.get("sync_result") is None:
-        with st.spinner("Syncing live NSE quotes & fundamentals…"):
-            run_signal_sync(user_id)
+        if db.leaderboard_count() > 0:
+            with st.spinner("Validating open forward-test signals…"):
+                run_light_validate(user_id)
+        else:
+            st.session_state.sync_result = {
+                "message": "Click Refresh on Screener for live 3-site verified data.",
+                "clearances": [],
+            }
 
     page = st.session_state.nav_page
     render_top_navbar(page, st.session_state.username or "")
     sync_msg = ""
     if st.session_state.get("sync_result"):
         sync_msg = f" · {st.session_state.sync_result.get('message', '')}"
+    ready_n = len(pipeline.filter_display_ready(db.get_leaderboard(limit=500)))
+    host = "cloud" if runtime.get("cloud") else "local"
     st.caption(
         f"user_id `{user_id}` · Forward-test qty **1** · "
-        f"Market: **live NSE**{sync_msg}"
+        f"Market: **live NSE** · host **{host}** · "
+        f"verified ready **{ready_n}**{sync_msg}"
     )
 
     if page == PAGE_SCREENER:

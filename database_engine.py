@@ -12,7 +12,7 @@ import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -25,6 +25,13 @@ DATABASE_PATH = os.environ.get(
 )
 _DB_LOCK = threading.RLock()
 FIXED_QUANTITY = 1
+IST = timezone(timedelta(hours=5, minutes=30))
+META_SCREENER_AS_OF = "screener_as_of_date"
+META_SCREENER_STATUS = "screener_refresh_status"  # idle | running | complete | failed
+META_SCREENER_MSG = "screener_refresh_message"
+META_REFRESH_T0 = "screener_refresh_t0"
+META_REFRESH_COMPLETE0 = "screener_refresh_complete0"
+LOAD_MAX_RETRIES = 3
 
 EXIT_SUCCESS = "SUCCESSFUL TRADE"
 EXIT_BAD = "BAD TRADE"
@@ -186,6 +193,221 @@ def _now_iso() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def today_ist() -> str:
+    """Trading calendar day in India (YYYY-MM-DD)."""
+    return datetime.now(IST).strftime("%Y-%m-%d")
+
+
+def get_meta(key: str, default: Optional[str] = None) -> Optional[str]:
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP
+                )
+                """
+            )
+            row = cursor.execute(
+                "SELECT value FROM app_meta WHERE key = ?", (key,)
+            ).fetchone()
+            return str(row["value"]) if row and row["value"] is not None else default
+    except Exception as exc:
+        logger.error("get_meta failed: %s", exc)
+        return default
+
+
+def set_meta(key: str, value: str) -> None:
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP
+                )
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO app_meta (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (key, str(value), _now_iso()),
+            )
+    except Exception as exc:
+        logger.error("set_meta failed: %s", exc)
+
+
+def screener_as_of() -> Optional[str]:
+    return get_meta(META_SCREENER_AS_OF)
+
+
+def screener_is_today() -> bool:
+    as_of = screener_as_of()
+    return bool(as_of) and as_of == today_ist()
+
+
+def set_screener_refresh_state(
+    *,
+    as_of: Optional[str] = None,
+    status: Optional[str] = None,
+    message: Optional[str] = None,
+) -> None:
+    if as_of is not None:
+        set_meta(META_SCREENER_AS_OF, as_of)
+    if status is not None:
+        set_meta(META_SCREENER_STATUS, status)
+    if message is not None:
+        set_meta(META_SCREENER_MSG, message)
+
+
+def _ensure_load_attempts_table(cursor: sqlite3.Cursor) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS screener_load_attempts (
+            ticker TEXT PRIMARY KEY,
+            attempts INTEGER DEFAULT 0,
+            last_error TEXT,
+            exhausted INTEGER DEFAULT 0,
+            updated_at TIMESTAMP
+        )
+        """
+    )
+
+
+def clear_load_attempts() -> None:
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            _ensure_load_attempts_table(cursor)
+            cursor.execute("DELETE FROM screener_load_attempts")
+    except Exception as exc:
+        logger.error("clear_load_attempts failed: %s", exc)
+
+
+def record_load_attempt(ticker: str, *, ok: bool, error: str = "") -> Dict[str, Any]:
+    """Increment attempts on failure; clear row on success. Exhaust after LOAD_MAX_RETRIES."""
+    sym = str(ticker or "").strip().upper()
+    if not sym:
+        return {"ticker": sym, "attempts": 0, "exhausted": False}
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            _ensure_load_attempts_table(cursor)
+            if ok:
+                cursor.execute("DELETE FROM screener_load_attempts WHERE ticker = ?", (sym,))
+                return {"ticker": sym, "attempts": 0, "exhausted": False}
+            row = cursor.execute(
+                "SELECT attempts FROM screener_load_attempts WHERE ticker = ?", (sym,)
+            ).fetchone()
+            attempts = int(row["attempts"]) + 1 if row else 1
+            exhausted = 1 if attempts >= LOAD_MAX_RETRIES else 0
+            cursor.execute(
+                """
+                INSERT INTO screener_load_attempts (ticker, attempts, last_error, exhausted, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(ticker) DO UPDATE SET
+                    attempts=excluded.attempts,
+                    last_error=excluded.last_error,
+                    exhausted=excluded.exhausted,
+                    updated_at=excluded.updated_at
+                """,
+                (sym, attempts, (error or "")[:240], exhausted, _now_iso()),
+            )
+            return {"ticker": sym, "attempts": attempts, "exhausted": bool(exhausted), "error": error}
+    except Exception as exc:
+        logger.error("record_load_attempt failed: %s", exc)
+        return {"ticker": sym, "attempts": 0, "exhausted": False}
+
+
+def list_exhausted_load_failures(limit: int = 200) -> List[Dict[str, Any]]:
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            _ensure_load_attempts_table(cursor)
+            rows = cursor.execute(
+                """
+                SELECT ticker, attempts, last_error, updated_at
+                FROM screener_load_attempts
+                WHERE COALESCE(exhausted, 0) = 1
+                ORDER BY ticker
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+            return [
+                {
+                    "ticker": str(r["ticker"]).upper(),
+                    "attempts": int(r["attempts"] or 0),
+                    "error": r["last_error"] or "fetch failed",
+                    "updated_at": r["updated_at"],
+                }
+                for r in rows
+            ]
+    except Exception as exc:
+        logger.error("list_exhausted_load_failures failed: %s", exc)
+        return []
+
+
+def exhausted_ticker_set() -> set:
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            _ensure_load_attempts_table(cursor)
+            rows = cursor.execute(
+                "SELECT ticker FROM screener_load_attempts WHERE COALESCE(exhausted, 0) = 1"
+            ).fetchall()
+            return {str(r["ticker"]).upper() for r in rows}
+    except Exception:
+        return set()
+
+
+def start_refresh_eta_clock(complete0: int = 0) -> None:
+    import time as _time
+
+    set_meta(META_REFRESH_T0, str(_time.time()))
+    set_meta(META_REFRESH_COMPLETE0, str(int(complete0)))
+
+
+def compute_refresh_eta_minutes(complete_now: int, target: int) -> Optional[float]:
+    """
+    ETA from wall-clock since refresh start.
+    Ignore the noisy first 1–2 completions (cold start), and floor the rate so
+    early ETA does not explode to multi-hour nonsense.
+    """
+    import time as _time
+
+    t0_raw = get_meta(META_REFRESH_T0)
+    c0_raw = get_meta(META_REFRESH_COMPLETE0, "0")
+    if not t0_raw:
+        return None
+    try:
+        t0 = float(t0_raw)
+        c0 = int(float(c0_raw or 0))
+    except (TypeError, ValueError):
+        return None
+    elapsed = max(_time.time() - t0, 1.0)
+    gained = max(0, int(complete_now) - c0)
+    remaining = max(0, int(target) - int(complete_now))
+    if remaining <= 0:
+        return 0.0
+    if gained < 3:
+        # Warm-up: assume ~8 ready/min once parallel load is humming
+        return round(remaining / 8.0, 1)
+    rate_per_min = gained / elapsed * 60.0
+    # Floor: parallel path should not be slower than ~4/min in steady state
+    rate_per_min = max(rate_per_min, 4.0)
+    if rate_per_min <= 0:
+        return None
+    return round(remaining / rate_per_min, 1)
+
+
 @contextmanager
 def get_connection(timeout: float = 30.0):
     conn = None
@@ -248,6 +470,25 @@ def _migrate_schema(cursor: sqlite3.Cursor) -> None:
             cursor.execute("DROP TABLE IF EXISTS screener_leaderboard")
 
 
+def _ensure_leaderboard_extra_columns(cursor: sqlite3.Cursor) -> None:
+    """Additive migrations for quality / PE columns."""
+    cols = set(_table_columns(cursor, "screener_leaderboard"))
+    additions = {
+        "pe_ratio": "REAL",
+        "roe": "REAL",
+        "data_quality": "TEXT",
+        "fundamentals_verified": "INTEGER DEFAULT 0",
+        "sources_ok_count": "INTEGER DEFAULT 0",
+        "ohlcv_ready": "INTEGER DEFAULT 0",
+        "price_source": "TEXT",
+        "price_kind": "TEXT",
+        "prev_close": "REAL",
+    }
+    for name, decl in additions.items():
+        if name not in cols:
+            cursor.execute(f"ALTER TABLE screener_leaderboard ADD COLUMN {name} {decl}")
+
+
 def init_database() -> bool:
     try:
         with get_connection() as conn:
@@ -289,7 +530,32 @@ def init_database() -> bool:
                     sma_200 REAL,
                     rsi_14 REAL,
                     delivery_pct_10d REAL,
-                    alpha_3m REAL
+                    alpha_3m REAL,
+                    pe_ratio REAL,
+                    data_quality TEXT,
+                    fundamentals_verified INTEGER DEFAULT 0,
+                    sources_ok_count INTEGER DEFAULT 0
+                )
+                """
+            )
+            _ensure_leaderboard_extra_columns(cursor)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS screener_load_attempts (
+                    ticker TEXT PRIMARY KEY,
+                    attempts INTEGER DEFAULT 0,
+                    last_error TEXT,
+                    exhausted INTEGER DEFAULT 0,
+                    updated_at TIMESTAMP
                 )
                 """
             )
@@ -343,6 +609,7 @@ def init_database() -> bool:
 
 def _seed_mock_leaderboard(cursor: sqlite3.Cursor) -> None:
     stamp = _now_iso()
+    _ensure_leaderboard_extra_columns(cursor)
     for row in MOCK_LEADERBOARD:
         cursor.execute(
             """
@@ -352,8 +619,9 @@ def _seed_mock_leaderboard(cursor: sqlite3.Cursor) -> None:
                 close_price, atr_value, is_buyable, last_updated,
                 roic, net_debt_ebitda, peg_ratio, interest_coverage,
                 promoter_pledge_pct, yoy_profit_growth, sma_50, sma_200,
-                rsi_14, delivery_pct_10d, alpha_3m
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                rsi_14, delivery_pct_10d, alpha_3m,
+                pe_ratio, data_quality, fundamentals_verified, sources_ok_count, ohlcv_ready
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 row["ticker"], row["company_name"], row["description"], row["sector"], row["industry"],
@@ -362,6 +630,11 @@ def _seed_mock_leaderboard(cursor: sqlite3.Cursor) -> None:
                 row["roic"], row["net_debt_ebitda"], row["peg_ratio"], row["interest_coverage"],
                 row["promoter_pledge_pct"], row["yoy_profit_growth"], row["sma_50"], row["sma_200"],
                 row["rsi_14"], row["delivery_pct_10d"], row["alpha_3m"],
+                row.get("pe_ratio") or 18.0,
+                "VERIFIED",
+                1,
+                3,
+                1,
             ),
         )
 
@@ -377,8 +650,147 @@ def leaderboard_is_empty() -> bool:
         return True
 
 
+def leaderboard_count() -> int:
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) AS cnt FROM screener_leaderboard")
+            return int(cursor.fetchone()["cnt"])
+    except Exception as exc:
+        logger.error("leaderboard_count failed: %s", exc)
+        return 0
+
+
+def list_leaderboard_tickers() -> List[str]:
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                "SELECT ticker FROM screener_leaderboard ORDER BY ticker"
+            ).fetchall()
+            return [str(r["ticker"]).upper() for r in rows]
+    except Exception as exc:
+        logger.error("list_leaderboard_tickers failed: %s", exc)
+        return []
+
+
+def tickers_missing_fundamentals(limit: int = 50) -> List[str]:
+    """Names in DB that are not yet 3-site fundamentals-verified."""
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            _ensure_leaderboard_extra_columns(cursor)
+            rows = cursor.execute(
+                """
+                SELECT ticker FROM screener_leaderboard
+                WHERE COALESCE(fundamentals_verified, 0) = 0
+                   OR COALESCE(data_quality, '') != 'VERIFIED'
+                   OR (
+                        (roic IS NULL OR roic = 0)
+                    AND (pe_ratio IS NULL OR pe_ratio = 0)
+                    AND (peg_ratio IS NULL OR peg_ratio = 0)
+                   )
+                ORDER BY ticker
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+            return [str(r["ticker"]).upper() for r in rows]
+    except Exception as exc:
+        logger.error("tickers_missing_fundamentals failed: %s", exc)
+        return []
+
+
+def fundamentals_coverage() -> Dict[str, int]:
+    """How many leaderboard rows have verified fundamentals."""
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            _ensure_leaderboard_extra_columns(cursor)
+            total = int(
+                cursor.execute("SELECT COUNT(*) AS c FROM screener_leaderboard").fetchone()["c"]
+            )
+            verified = int(
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS c FROM screener_leaderboard
+                    WHERE COALESCE(fundamentals_verified, 0) = 1
+                      AND COALESCE(data_quality, '') = 'VERIFIED'
+                    """
+                ).fetchone()["c"]
+            )
+            ohlcv = int(
+                cursor.execute(
+                    "SELECT COUNT(*) AS c FROM screener_leaderboard WHERE COALESCE(ohlcv_ready, 0) = 1"
+                ).fetchone()["c"]
+            )
+            complete = int(
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS c FROM screener_leaderboard
+                    WHERE COALESCE(close_price, 0) > 0
+                      AND COALESCE(fundamentals_verified, 0) = 1
+                      AND COALESCE(data_quality, '') = 'VERIFIED'
+                      AND COALESCE(ohlcv_ready, 0) = 1
+                      AND COALESCE(sources_ok_count, 0) >= 3
+                    """
+                ).fetchone()["c"]
+            )
+            return {
+                "total": total,
+                "verified": verified,
+                "missing": max(0, total - verified),
+                "ohlcv": ohlcv,
+                "complete": complete,
+            }
+    except Exception as exc:
+        logger.error("fundamentals_coverage failed: %s", exc)
+        return {"total": 0, "verified": 0, "missing": 0, "ohlcv": 0, "complete": 0}
+
+
+def tickers_missing_full_data(limit: int = 50) -> List[str]:
+    """Names missing price, 3-site fundamentals, or OHLCV technicals."""
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            _ensure_leaderboard_extra_columns(cursor)
+            rows = cursor.execute(
+                """
+                SELECT ticker FROM screener_leaderboard
+                WHERE COALESCE(close_price, 0) <= 0
+                   OR COALESCE(fundamentals_verified, 0) = 0
+                   OR COALESCE(data_quality, '') != 'VERIFIED'
+                   OR COALESCE(ohlcv_ready, 0) = 0
+                   OR COALESCE(sources_ok_count, 0) < 3
+                ORDER BY ticker
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+            return [str(r["ticker"]).upper() for r in rows]
+    except Exception as exc:
+        logger.error("tickers_missing_full_data failed: %s", exc)
+        return []
+
+
+def clear_leaderboard() -> int:
+    """Remove all screener rows (use before a clean live swing-universe load)."""
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) AS cnt FROM screener_leaderboard")
+            n = int(cursor.fetchone()["cnt"])
+            cursor.execute("DELETE FROM screener_leaderboard")
+            return n
+    except Exception as exc:
+        logger.error("clear_leaderboard failed: %s", exc)
+        return 0
+
+
 def ensure_mock_leaderboard() -> None:
-    """Emergency / offline seed only — not used as primary market source in live mode."""
+    """Offline/test seed ONLY when MEDALLION_MARKET_MODE=mock|offline|test."""
+    market_mode = os.environ.get("MEDALLION_MARKET_MODE", "live").strip().lower()
+    if market_mode not in {"mock", "offline", "test"}:
+        return
     try:
         with get_connection() as conn:
             cursor = conn.cursor()
@@ -449,7 +861,7 @@ def get_username(user_id: int) -> Optional[str]:
         return None
 
 
-def get_leaderboard(limit: int = 50) -> pd.DataFrame:
+def get_leaderboard(limit: int = 1000) -> pd.DataFrame:
     try:
         with get_connection() as conn:
             df = pd.read_sql_query(
@@ -506,7 +918,20 @@ def upsert_leaderboard_rows(rows: List[Dict[str, Any]]) -> bool:
     try:
         with get_connection() as conn:
             cursor = conn.cursor()
+            _ensure_leaderboard_extra_columns(cursor)
             for row in rows:
+                sources = row.get("fundamentals_sources") or []
+                sources_n = int(row.get("sources_ok_count") or (len(sources) if sources else 0))
+                verified = 1 if row.get("fundamentals_verified") else 0
+                quality = str(row.get("data_quality") or ("VERIFIED" if verified else "UNVERIFIED"))
+                ohlcv = 1 if row.get("ohlcv_ready") else 0
+                price_source = str(row.get("price_source") or "")[:40] or None
+                price_kind = str(row.get("price_kind") or "")[:20] or None
+                prev_close = row.get("prev_close")
+                try:
+                    prev_close = float(prev_close) if prev_close is not None else None
+                except (TypeError, ValueError):
+                    prev_close = None
                 cursor.execute(
                     """
                     INSERT INTO screener_leaderboard (
@@ -515,8 +940,10 @@ def upsert_leaderboard_rows(rows: List[Dict[str, Any]]) -> bool:
                         close_price, atr_value, is_buyable, last_updated,
                         roic, net_debt_ebitda, peg_ratio, interest_coverage,
                         promoter_pledge_pct, yoy_profit_growth, sma_50, sma_200,
-                        rsi_14, delivery_pct_10d, alpha_3m
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        rsi_14, delivery_pct_10d, alpha_3m,
+                        pe_ratio, roe, data_quality, fundamentals_verified, sources_ok_count,
+                        ohlcv_ready, price_source, price_kind, prev_close
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(ticker) DO UPDATE SET
                         company_name=excluded.company_name,
                         description=excluded.description,
@@ -539,7 +966,16 @@ def upsert_leaderboard_rows(rows: List[Dict[str, Any]]) -> bool:
                         sma_200=excluded.sma_200,
                         rsi_14=excluded.rsi_14,
                         delivery_pct_10d=excluded.delivery_pct_10d,
-                        alpha_3m=excluded.alpha_3m
+                        alpha_3m=excluded.alpha_3m,
+                        pe_ratio=excluded.pe_ratio,
+                        roe=excluded.roe,
+                        data_quality=excluded.data_quality,
+                        fundamentals_verified=excluded.fundamentals_verified,
+                        sources_ok_count=excluded.sources_ok_count,
+                        ohlcv_ready=excluded.ohlcv_ready,
+                        price_source=COALESCE(excluded.price_source, screener_leaderboard.price_source),
+                        price_kind=COALESCE(excluded.price_kind, screener_leaderboard.price_kind),
+                        prev_close=COALESCE(excluded.prev_close, screener_leaderboard.prev_close)
                     """,
                     (
                         row["ticker"], row.get("company_name", row["ticker"]),
@@ -547,18 +983,90 @@ def upsert_leaderboard_rows(rows: List[Dict[str, Any]]) -> bool:
                         row.get("composite_score", 0.0), row.get("fundamental_score", 0.0),
                         row.get("technical_score", 0.0), row.get("close_price", 0.0),
                         row.get("atr_value", 0.0), int(row.get("is_buyable", 0)), stamp,
-                        row.get("roic", 0.0), row.get("net_debt_ebitda", 0.0),
-                        row.get("peg_ratio", 0.0), row.get("interest_coverage", 0.0),
-                        row.get("promoter_pledge_pct", 0.0), row.get("yoy_profit_growth", 0.0),
+                        row.get("roic"), row.get("net_debt_ebitda"),
+                        row.get("peg_ratio"), row.get("interest_coverage"),
+                        row.get("promoter_pledge_pct"), row.get("yoy_profit_growth"),
                         row.get("sma_50", 0.0), row.get("sma_200", 0.0),
                         row.get("rsi_14", 50.0), row.get("delivery_pct_10d", 0.0),
                         row.get("alpha_3m", 0.0),
+                        row.get("pe_ratio"),
+                        row.get("roe"),
+                        quality,
+                        verified,
+                        sources_n,
+                        ohlcv,
+                        price_source,
+                        price_kind,
+                        prev_close,
                     ),
                 )
         return True
     except Exception as exc:
         logger.error("upsert_leaderboard_rows failed: %s", exc)
         return False
+
+
+def delete_tickers(tickers: List[str]) -> int:
+    """Remove incomplete / rejected tickers from the screener board."""
+    if not tickers:
+        return 0
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            n = 0
+            for t in tickers:
+                cursor.execute(
+                    "DELETE FROM screener_leaderboard WHERE ticker = ?",
+                    (str(t).upper(),),
+                )
+                n += cursor.rowcount
+            return n
+    except Exception as exc:
+        logger.error("delete_tickers failed: %s", exc)
+        return 0
+
+
+def purge_outside_universe(universe: List[str]) -> Dict[str, int]:
+    """Delete leaderboard + load-attempt rows that are not in the active universe."""
+    keep = {str(t).strip().upper() for t in universe if str(t).strip()}
+    removed_board = 0
+    removed_attempts = 0
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            board = [
+                str(r["ticker"]).upper()
+                for r in cursor.execute("SELECT ticker FROM screener_leaderboard").fetchall()
+            ]
+            outside = [t for t in board if t not in keep]
+            for t in outside:
+                cursor.execute("DELETE FROM screener_leaderboard WHERE ticker = ?", (t,))
+                removed_board += cursor.rowcount
+            _ensure_load_attempts_table(cursor)
+            attempts = [
+                str(r["ticker"]).upper()
+                for r in cursor.execute("SELECT ticker FROM screener_load_attempts").fetchall()
+            ]
+            for t in attempts:
+                if t not in keep:
+                    cursor.execute("DELETE FROM screener_load_attempts WHERE ticker = ?", (t,))
+                    removed_attempts += cursor.rowcount
+        return {"board": removed_board, "attempts": removed_attempts, "kept": len(keep)}
+    except Exception as exc:
+        logger.error("purge_outside_universe failed: %s", exc)
+        return {"board": 0, "attempts": 0, "kept": len(keep)}
+
+
+def universe_leaderboard_count(universe: List[str]) -> int:
+    """How many active-universe tickers are already on the board."""
+    keep = {str(t).strip().upper() for t in universe if str(t).strip()}
+    if not keep:
+        return 0
+    try:
+        have = set(list_leaderboard_tickers())
+        return len(have & keep)
+    except Exception:
+        return 0
 
 
 def get_active_positions(user_id: int) -> pd.DataFrame:

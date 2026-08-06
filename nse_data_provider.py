@@ -32,13 +32,35 @@ UNIVERSE_PATH = BASE_DIR / "data" / "nse_universe.txt"
 BENCHMARK = "^NSEI"
 RSI_OVERBOUGHT = 65.0
 
+# Swing Screener universe = Nifty Midcap 150 + Nifty Smallcap 50 (~200)
+NSE_MIDCAP150_CSV = "https://archives.nseindia.com/content/indices/ind_niftymidcap150list.csv"
+NSE_SMALLCAP50_CSV = "https://archives.nseindia.com/content/indices/ind_niftysmallcap50list.csv"
+UNIVERSE_LABEL = "Midcap 150 + Smallcap 50"
+UNIVERSE_TARGET_HINT = 200
+
 # Market mode: live (default) | mock
 MARKET_MODE = os.environ.get("MEDALLION_MARKET_MODE", "live").strip().lower()
 SSL_VERIFY = os.environ.get("MEDALLION_SSL_VERIFY", "0").strip() not in {"0", "false", "False", "no"}
 
+# Cloud hosts (Streamlit Cloud) need short timeouts — Yahoo often 404s some symbols.
+HTTP_TIMEOUT = int(os.environ.get("MEDALLION_HTTP_TIMEOUT", "12"))
 _HTTP_LOCK = threading.Lock()
 _LAST_REQUEST_TS = 0.0
-_MIN_GAP_SEC = 0.35
+# Soft rate gap between Yahoo chart calls (seconds). Kept tiny so parallel loads work.
+_MIN_GAP_SEC = float(os.environ.get("MEDALLION_HTTP_GAP", "0.02"))
+
+# Liquid bootstrap set — fast first paint after login (prices only, no Screener scrape)
+BOOTSTRAP_TICKERS = [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "ITC",
+    "SBIN", "BHARTIARTL", "LT", "AXISBANK", "HCLTECH", "WIPRO",
+]
+
+# Yahoo symbol remaps (corporate actions / renamed listings)
+YAHOO_ALIASES = {
+    "TATAMOTORS": ["TATAMOTORS.NS", "TMPV.NS"],
+    "LTIM": ["LTIM.NS", "LTI.NS"],
+    "M&M": ["M&M.NS", "M%26M.NS"],
+}
 
 
 def normalize_ticker(ticker: str) -> str:
@@ -56,6 +78,16 @@ def to_yahoo_symbol(ticker: str) -> str:
     return f"{t}.NS"
 
 
+def yahoo_symbol_candidates(ticker: str) -> List[str]:
+    t = normalize_ticker(ticker)
+    if t in {"^NSEI", "NSEI", "NIFTY", "NIFTY50"}:
+        return ["^NSEI"]
+    aliases = YAHOO_ALIASES.get(t)
+    if aliases:
+        return aliases
+    return [f"{t}.NS"]
+
+
 def load_universe() -> List[str]:
     if UNIVERSE_PATH.exists():
         tickers = []
@@ -66,80 +98,255 @@ def load_universe() -> List[str]:
             tickers.append(normalize_ticker(line))
         if tickers:
             return tickers
-    return ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "ITC", "SBIN"]
+    return list(BOOTSTRAP_TICKERS)
 
 
-def _session_get(url: str, timeout: int = 35) -> Optional[Any]:
-    """HTTP GET via curl_cffi (Chrome impersonation) with polite pacing."""
-    global _LAST_REQUEST_TS
+def universe_label() -> str:
+    return UNIVERSE_LABEL
+
+
+def _download_nse_index_symbols(csv_url: str) -> List[str]:
+    """Download an official NSE index constituent CSV and return Symbol list."""
+    from curl_cffi import requests as cr
+
+    resp = cr.get(
+        csv_url,
+        impersonate="chrome124",
+        timeout=max(HTTP_TIMEOUT, 45),
+        verify=SSL_VERIFY,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.nseindia.com/",
+        },
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"NSE CSV download failed HTTP {resp.status_code}: {csv_url}")
+
+    import csv
+    import io
+
+    text = resp.text
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    rows = list(csv.DictReader(io.StringIO(text)))
+    symbols: List[str] = []
+    for row in rows:
+        sym = normalize_ticker(row.get("Symbol") or "")
+        if sym:
+            symbols.append(sym)
+    return symbols
+
+
+def refresh_swing_universe(*, write_file: bool = True) -> List[str]:
+    """
+    Build Screener universe: Nifty Midcap 150 ∪ Nifty Smallcap 50.
+
+    Smallcap 50 is NSE's official top-50 liquid smallcaps (preferred over
+    alphabetical first-50 of Smallcap 250).
+    """
+    mid = _download_nse_index_symbols(NSE_MIDCAP150_CSV)
+    small = _download_nse_index_symbols(NSE_SMALLCAP50_CSV)
+    if len(mid) < 120:
+        raise RuntimeError(f"Unexpected Midcap 150 size: {len(mid)}")
+    if len(small) < 40:
+        raise RuntimeError(f"Unexpected Smallcap 50 size: {len(small)}")
+
+    seen = set()
+    symbols: List[str] = []
+    for sym in mid + small:
+        if sym not in seen:
+            seen.add(sym)
+            symbols.append(sym)
+
+    if write_file:
+        UNIVERSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        header = (
+            f"# Swing universe — {UNIVERSE_LABEL} (official NSE lists)\n"
+            f"# Midcap 150: {len(mid)} · Smallcap 50: {len(small)} · "
+            f"unique: {len(symbols)}\n"
+            f"# Refreshed by nse_data_provider.refresh_swing_universe()\n"
+        )
+        UNIVERSE_PATH.write_text(header + "\n".join(symbols) + "\n", encoding="utf-8")
+        logger.info(
+            "Wrote swing universe %s symbols (mid=%s small=%s) → %s",
+            len(symbols),
+            len(mid),
+            len(small),
+            UNIVERSE_PATH,
+        )
+    return symbols
+
+
+def ensure_swing_universe() -> List[str]:
+    """Refresh Mid150+Small50 from NSE; fall back to local file on failure."""
+    try:
+        return refresh_swing_universe(write_file=True)
+    except Exception as exc:
+        logger.warning("Swing universe refresh failed (%s) — using local file", exc)
+        return load_universe()
+
+
+def _session_get(url: str, timeout: Optional[int] = None) -> Optional[Any]:
+    """HTTP GET via curl_cffi (Chrome impersonation) with polite pacing.
+
+    Lock is only held for rate-limit bookkeeping — never during the network call —
+    so parallel ticker loads can actually run concurrently.
+    """
+    global _LAST_REQUEST_TS, SSL_VERIFY
+    timeout = HTTP_TIMEOUT if timeout is None else timeout
     try:
         from curl_cffi import requests as cr
     except ImportError as exc:
         logger.error("curl_cffi missing: %s", exc)
         return None
 
+    def _do(verify_flag: bool):
+        return cr.get(
+            url,
+            impersonate="chrome124",
+            timeout=timeout,
+            verify=verify_flag,
+            headers={
+                "Accept": "application/json,text/html,*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+            },
+        )
+
+    # Pace without serializing the full request
     with _HTTP_LOCK:
         gap = time.time() - _LAST_REQUEST_TS
-        if gap < _MIN_GAP_SEC:
-            time.sleep(_MIN_GAP_SEC - gap)
-        try:
-            resp = cr.get(
-                url,
-                impersonate="chrome124",
-                timeout=timeout,
-                verify=SSL_VERIFY,
-                headers={
-                    "Accept": "application/json,text/html,*/*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-            )
+        wait = (_MIN_GAP_SEC - gap) if gap < _MIN_GAP_SEC else 0.0
+        if wait <= 0:
             _LAST_REQUEST_TS = time.time()
-            if resp.status_code >= 400:
-                logger.warning("HTTP %s for %s", resp.status_code, url[:90])
-                return None
-            return resp
-        except Exception as exc:
-            logger.warning("HTTP failed %s: %s", url[:90], exc)
+    if wait > 0:
+        time.sleep(wait)
+        with _HTTP_LOCK:
             _LAST_REQUEST_TS = time.time()
+
+    try:
+        resp = _do(SSL_VERIFY)
+        if resp.status_code >= 400:
+            logger.warning("HTTP %s for %s", resp.status_code, url[:90])
             return None
+        return resp
+    except Exception as exc:
+        msg = str(exc).lower()
+        if SSL_VERIFY and ("ssl" in msg or "certificate" in msg):
+            try:
+                logger.warning("SSL verify failed — retrying with MEDALLION_SSL_VERIFY=0")
+                SSL_VERIFY = False
+                resp = _do(False)
+                if resp.status_code >= 400:
+                    return None
+                return resp
+            except Exception as exc2:
+                logger.warning("HTTP failed %s: %s", url[:90], exc2)
+                return None
+        logger.warning("HTTP failed %s: %s", url[:90], exc)
+        return None
+
+
+def _parse_chart_payload(payload: Dict[str, Any]) -> pd.DataFrame:
+    result = (payload.get("chart") or {}).get("result") or []
+    if not result:
+        return pd.DataFrame()
+    node = result[0]
+    ts = node.get("timestamp") or []
+    quote = (node.get("indicators") or {}).get("quote") or [{}]
+    q0 = quote[0] if quote else {}
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(ts, unit="s"),
+            "open": q0.get("open"),
+            "high": q0.get("high"),
+            "low": q0.get("low"),
+            "close": q0.get("close"),
+            "volume": q0.get("volume"),
+        }
+    )
+    frame = frame.dropna(subset=["close"]).reset_index(drop=True)
+    frame.attrs["meta"] = node.get("meta") or {}
+    return frame
+
+
+def _fetch_ohlcv_yfinance(ticker: str, range_param: str = "1y", interval: str = "1d") -> pd.DataFrame:
+    """Secondary path when direct Yahoo chart HTTP is blocked (common on cloud IPs)."""
+    try:
+        import yfinance as yf
+    except ImportError:
+        return pd.DataFrame()
+
+    period_map = {
+        "1mo": "1mo",
+        "3mo": "3mo",
+        "6mo": "6mo",
+        "1y": "1y",
+        "2y": "2y",
+        "5y": "5y",
+        "max": "max",
+    }
+    period = period_map.get(range_param, "1y")
+    for symbol in yahoo_symbol_candidates(ticker):
+        try:
+            hist = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
+            if hist is None or hist.empty:
+                continue
+            idx = pd.to_datetime(hist.index)
+            try:
+                if getattr(idx, "tz", None) is not None:
+                    idx = idx.tz_convert(None)
+            except Exception:
+                idx = pd.to_datetime(hist.index).tz_localize(None)
+            frame = pd.DataFrame(
+                {
+                    "date": idx,
+                    "open": hist["Open"].to_numpy(),
+                    "high": hist["High"].to_numpy(),
+                    "low": hist["Low"].to_numpy(),
+                    "close": hist["Close"].to_numpy(),
+                    "volume": hist["Volume"].to_numpy() if "Volume" in hist.columns else 0,
+                }
+            )
+            frame = frame.dropna(subset=["close"]).reset_index(drop=True)
+            if not frame.empty:
+                frame.attrs["meta"] = {"symbol": symbol, "source": "yfinance"}
+                return frame
+        except Exception as exc:
+            logger.warning("yfinance OHLCV failed %s: %s", symbol, exc)
+    return pd.DataFrame()
 
 
 def fetch_ohlcv(ticker: str, range_param: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    """Fetch NSE daily bars from Yahoo chart API."""
-    symbol = to_yahoo_symbol(ticker)
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        f"?range={range_param}&interval={interval}&events=div%7Csplit"
+    """Fetch NSE daily bars: Yahoo chart HTTP → yfinance → empty (caller may multi-source CMP)."""
+    hosts = (
+        "https://query1.finance.yahoo.com",
+        "https://query2.finance.yahoo.com",
     )
-    resp = _session_get(url)
-    if resp is None:
-        return pd.DataFrame()
-    try:
-        payload = resp.json()
-        result = (payload.get("chart") or {}).get("result") or []
-        if not result:
-            return pd.DataFrame()
-        node = result[0]
-        ts = node.get("timestamp") or []
-        quote = (node.get("indicators") or {}).get("quote") or [{}]
-        q0 = quote[0] if quote else {}
-        frame = pd.DataFrame(
-            {
-                "date": pd.to_datetime(ts, unit="s"),
-                "open": q0.get("open"),
-                "high": q0.get("high"),
-                "low": q0.get("low"),
-                "close": q0.get("close"),
-                "volume": q0.get("volume"),
-            }
-        )
-        frame = frame.dropna(subset=["close"]).reset_index(drop=True)
-        meta = node.get("meta") or {}
-        frame.attrs["meta"] = meta
-        return frame
-    except Exception as exc:
-        logger.error("parse ohlcv failed for %s: %s", ticker, exc)
-        return pd.DataFrame()
+    for symbol in yahoo_symbol_candidates(ticker):
+        for host in hosts:
+            url = (
+                f"{host}/v8/finance/chart/{symbol}"
+                f"?range={range_param}&interval={interval}&events=div%7Csplit"
+            )
+            resp = _session_get(url)
+            if resp is None:
+                continue
+            try:
+                frame = _parse_chart_payload(resp.json())
+                if not frame.empty:
+                    return frame
+            except Exception as exc:
+                logger.error("parse ohlcv failed for %s: %s", symbol, exc)
+
+    yf_frame = _fetch_ohlcv_yfinance(ticker, range_param=range_param, interval=interval)
+    if not yf_frame.empty:
+        return yf_frame
+    return pd.DataFrame()
 
 
 def _rsi(closes: pd.Series, period: int = 14) -> float:
@@ -246,10 +453,10 @@ def fetch_fundamentals_screener(ticker: str) -> Dict[str, Any]:
     # Screener uses URL-safe symbols; M&M → M%26M, BAJAJ-AUTO stays
     slug = symbol.replace("&", "%26")
     url = f"https://www.screener.in/company/{slug}/consolidated/"
-    resp = _session_get(url, timeout=40)
+    resp = _session_get(url, timeout=15)
     if resp is None:
         # some tickers only have standalone pages
-        resp = _session_get(f"https://www.screener.in/company/{slug}/", timeout=40)
+        resp = _session_get(f"https://www.screener.in/company/{slug}/", timeout=15)
     if resp is None:
         return {}
 
@@ -328,62 +535,52 @@ def fetch_fundamentals_screener(ticker: str) -> Dict[str, Any]:
     if pe and growth_for_peg and growth_for_peg > 0:
         peg = round(pe / growth_for_peg, 2)
 
-    # Interest coverage / net debt not always on top card — infer soft defaults from ROCE
-    net_debt_ebitda = 0.5 if (roe or 0) >= 20 else 1.5
-    interest_coverage = 12.0 if (roe or 0) >= 20 else 4.0
-
+    # Never invent debt / coverage / PEG / ROCE defaults — missing stays None
     return {
         "company_name": title or symbol,
         "description": desc or f"NSE-listed equity {symbol}.",
         "sector": sector or "—",
         "industry": industry or "—",
-        "roic": round(float(roce if roce is not None else (roe or 0.0)), 2),
-        "roe": round(float(roe or 0.0), 2),
-        "peg_ratio": float(peg if peg is not None else 1.5),
-        "net_debt_ebitda": float(net_debt_ebitda),
-        "interest_coverage": float(interest_coverage),
-        "promoter_pledge_pct": 0.0,
+        "roic": round(float(roce), 2) if roce is not None else None,
+        "roe": round(float(roe), 2) if roe is not None else None,
+        "peg_ratio": float(peg) if peg is not None else None,
+        "net_debt_ebitda": None,
+        "interest_coverage": None,
+        "promoter_pledge_pct": 0.0 if promoter is not None else None,
         "promoter_holding_pct": float(promoter) if promoter is not None else None,
-        "yoy_profit_growth": float(profit_growth if profit_growth is not None else (sales_growth or 0.0)),
+        "yoy_profit_growth": float(profit_growth) if profit_growth is not None else (
+            float(sales_growth) if sales_growth is not None else None
+        ),
         "pe_ratio": float(pe) if pe is not None else None,
     }
 
 
 def _score_fundamental(row: Dict[str, Any]) -> float:
-    score = 0.0
-    roic = float(row.get("roic") or 0)
-    peg = float(row.get("peg_ratio") or 99)
-    debt = float(row.get("net_debt_ebitda") or 99)
-    ic = float(row.get("interest_coverage") or 0)
-    growth = float(row.get("yoy_profit_growth") or 0)
-    score += min(max(roic, 0) / 2.0, 20)  # up to 20
-    score += 10 if peg <= 1.5 else (6 if peg <= 2.5 else 2)
-    score += 10 if debt <= 1.5 else (5 if debt <= 3 else 1)
-    score += 8 if ic >= 4 else 3
-    score += min(max(growth, 0) / 2.0, 10)
-    return round(min(score, 50.0), 1)
+    try:
+        import factor_engine as fe
+
+        return float(fe.evaluate_fundamental_checklist(row)["total_marks"])
+    except Exception:
+        return 0.0
 
 
 def _score_technical(row: Dict[str, Any]) -> float:
-    score = 0.0
-    close = float(row.get("close_price") or 0)
-    sma200 = float(row.get("sma_200") or 0)
-    rsi = float(row.get("rsi_14") or 50)
-    alpha = float(row.get("alpha_3m") or 0)
-    delivery = float(row.get("delivery_pct_10d") or 0)
-    if close > sma200:
-        score += 18
-    elif close > sma200 * 0.98:
-        score += 8
-    if 45 <= rsi <= 65:
-        score += 14
-    elif rsi < 45:
-        score += 8
-    else:
-        score += 3
-    score += min(max(alpha, 0) / 2.0, 10)
-    score += 8 if delivery >= 40 else 3
-    return round(min(score, 50.0), 1)
+    try:
+        import factor_engine as fe
+
+        return float(fe.evaluate_technical_checklist(row)["total_marks"])
+    except Exception:
+        return 0.0
+
+
+def _fetch_fundamentals_safe(ticker: str) -> Dict[str, Any]:
+    try:
+        import multi_source_data as msd
+
+        return msd.fetch_verified_fundamentals(ticker)
+    except Exception as exc:
+        logger.warning("multi-source fundamentals failed for %s: %s", ticker, exc)
+        return {"data_quality": "UNVERIFIED", "fundamentals_verified": False}
 
 
 def build_live_row(
@@ -393,45 +590,103 @@ def build_live_row(
     prior: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     ticker = normalize_ticker(ticker)
-    hist = fetch_ohlcv(ticker, range_param="1y", interval="1d")
-    if hist.empty:
-        return None
-
-    tech = compute_technicals(hist, bench_frame)
-    meta = hist.attrs.get("meta") or {}
     prior = prior or {}
 
     fund: Dict[str, Any] = {}
+    # OHLCV + fundamentals in parallel (biggest per-ticker speedup)
     if include_fundamentals:
-        try:
-            fund = fetch_fundamentals_screener(ticker)
-        except Exception as exc:
-            logger.warning("fundamentals failed for %s: %s", ticker, exc)
-            fund = {}
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_hist = pool.submit(fetch_ohlcv, ticker, "1y", "1d")
+            fut_fund = pool.submit(_fetch_fundamentals_safe, ticker)
+            hist = fut_hist.result()
+            fund = fut_fund.result() or {}
+    else:
+        hist = fetch_ohlcv(ticker, range_param="1y", interval="1d")
+
+    # Fallback when Yahoo chart is blocked: still build a row from Tickertape/MC/Screener CMP
+    ohlcv_ready = False
+    if hist is None or getattr(hist, "empty", True):
+        logger.warning("Yahoo OHLCV empty for %s — trying multi-source price fallback", ticker)
+        px = None
+        if fund.get("close_price"):
+            px = float(fund["close_price"])
+        else:
+            try:
+                import multi_source_data as msd
+
+                tt = msd.fetch_tickertape(ticker)
+                mc = msd.fetch_moneycontrol(ticker)
+                px = tt.get("close_price") or mc.get("close_price")
+                if not fund.get("company_name") and tt.get("company_name"):
+                    fund["company_name"] = tt.get("company_name")
+                    fund["sector"] = tt.get("sector") or fund.get("sector")
+            except Exception as exc:
+                logger.warning("price fallback failed for %s: %s", ticker, exc)
+        if px is None and prior.get("close_price"):
+            px = float(prior["close_price"])
+        if px is None:
+            return None
+        # Minimal technicals from prior — do NOT invent buyable RSI/SMA scores
+        if prior.get("ohlcv_ready") and prior.get("sma_200"):
+            tech = {
+                "close_price": round(float(px), 2),
+                "sma_50": float(prior.get("sma_50") or px),
+                "sma_200": float(prior.get("sma_200") or px),
+                "rsi_14": float(prior.get("rsi_14") or 50.0),
+                "atr_value": float(prior.get("atr_value") or max(px * 0.02, 0.05)),
+                "alpha_3m": float(prior.get("alpha_3m") or 0.0),
+                "delivery_pct_10d": float(prior.get("delivery_pct_10d") or 45.0),
+            }
+            ohlcv_ready = True
+        else:
+            tech = {
+                "close_price": round(float(px), 2),
+                "sma_50": round(float(px), 2),
+                "sma_200": round(float(px), 2),
+                "rsi_14": 50.0,
+                "atr_value": float(prior.get("atr_value") or max(px * 0.02, 0.05)),
+                "alpha_3m": 0.0,
+                "delivery_pct_10d": 0.0,
+            }
+        meta = {}
+        if not fund.get("description"):
+            fund["description"] = (
+                "Price from multi-source (Tickertape/Moneycontrol/Screener); "
+                "technicals pending until Yahoo OHLCV returns."
+            )
+    else:
+        tech = compute_technicals(hist, bench_frame)
+        meta = hist.attrs.get("meta") or {}
+        ohlcv_ready = True
 
     company_name = (
         fund.get("company_name")
         or meta.get("longName")
         or meta.get("shortName")
-        or prior.get("company_name")
+        or (prior or {}).get("company_name")
         or ticker
     )
-    description = fund.get("description") or prior.get("description") or f"NSE equity {company_name}."
-    sector = fund.get("sector") or prior.get("sector") or "—"
-    industry = fund.get("industry") or prior.get("industry") or "—"
+    description = fund.get("description") or (prior or {}).get("description") or f"NSE equity {company_name}."
+    sector = fund.get("sector") or (prior or {}).get("sector") or "—"
+    industry = fund.get("industry") or (prior or {}).get("industry") or "—"
 
-    # Prefer live fundamentals; else keep prior DB values
-    def pick(key: str, default: float = 0.0) -> float:
+    def pick_optional(key: str) -> Optional[float]:
+        """Only trust multi-source consensus / explicit values — NEVER invent defaults."""
         if key in fund and fund[key] is not None:
-            return float(fund[key])
-        if prior.get(key) is not None:
-            return float(prior[key])
-        return float(default)
+            try:
+                return float(fund[key])
+            except (TypeError, ValueError):
+                return None
+        return None
 
-    # Promoter pledge: Screener gives holding; pledge rarely free — keep prior or 0
-    promoter_pledge = pick("promoter_pledge_pct", 0.0)
-    if fund.get("promoter_holding_pct") is not None and not prior.get("promoter_pledge_pct"):
-        promoter_pledge = 0.0  # holding known; pledge unknown → do not invent
+    # Price: Yahoo technicals primary; override only if multi-source CMP verified and close
+    close_price = tech["close_price"]
+    ms_px = pick_optional("close_price")
+    if ms_px and abs(ms_px - close_price) / max(close_price, 1e-9) < 0.08:
+        close_price = round((close_price + ms_px) / 2.0, 2)
+
+    quality = str(fund.get("data_quality") or "UNVERIFIED")
+    verified = bool(fund.get("fundamentals_verified"))
 
     row: Dict[str, Any] = {
         "ticker": ticker,
@@ -439,26 +694,53 @@ def build_live_row(
         "description": description,
         "sector": sector,
         "industry": industry,
-        "close_price": tech["close_price"],
+        "close_price": close_price,
         "atr_value": tech["atr_value"],
         "sma_50": tech["sma_50"],
         "sma_200": tech["sma_200"],
         "rsi_14": tech["rsi_14"],
         "delivery_pct_10d": tech["delivery_pct_10d"],
         "alpha_3m": tech["alpha_3m"],
-        "roic": pick("roic", 12.0),
-        "net_debt_ebitda": pick("net_debt_ebitda", 1.5),
-        "peg_ratio": pick("peg_ratio", 1.5),
-        "interest_coverage": pick("interest_coverage", 5.0),
-        "promoter_pledge_pct": promoter_pledge,
-        "yoy_profit_growth": pick("yoy_profit_growth", 10.0),
+        "roic": pick_optional("roic"),
+        "roe": pick_optional("roe"),
+        "net_debt_ebitda": pick_optional("net_debt_ebitda"),
+        "peg_ratio": pick_optional("peg_ratio"),
+        "interest_coverage": pick_optional("interest_coverage"),
+        "promoter_pledge_pct": pick_optional("promoter_pledge_pct"),
+        "yoy_profit_growth": pick_optional("yoy_profit_growth"),
+        "pe_ratio": pick_optional("pe_ratio"),
+        "promoter_holding_pct": fund.get("promoter_holding_pct"),
+        "fundamentals_verified": verified,
+        "data_quality": quality,
+        "fundamentals_sources": fund.get("fundamentals_sources") or [],
+        "sources_ok_count": int(
+            fund.get("sources_ok_count")
+            or len(fund.get("fundamentals_sources") or [])
+        ),
+        "fundamentals_report": fund.get("fundamentals_report"),
+        "ohlcv_ready": bool(ohlcv_ready),
     }
+    for key in (
+        "roic",
+        "roe",
+        "net_debt_ebitda",
+        "peg_ratio",
+        "interest_coverage",
+        "promoter_pledge_pct",
+        "yoy_profit_growth",
+        "pe_ratio",
+    ):
+        if row[key] is None:
+            row[key] = None
+
     row["fundamental_score"] = _score_fundamental(row)
-    row["technical_score"] = _score_technical(row)
-    row["composite_score"] = round(row["fundamental_score"] + row["technical_score"], 1)
+    row["technical_score"] = _score_technical(row) if ohlcv_ready else 0.0
+    row["composite_score"] = round(float(row["fundamental_score"]) + float(row["technical_score"]), 1)
     row["is_buyable"] = (
         1
-        if row["close_price"] > row["sma_200"] and row["rsi_14"] <= RSI_OVERBOUGHT
+        if ohlcv_ready
+        and row["close_price"] > row["sma_200"]
+        and row["rsi_14"] <= RSI_OVERBOUGHT
         else 0
     )
     return row
@@ -466,12 +748,17 @@ def build_live_row(
 
 def refresh_universe_live(
     tickers: Optional[List[str]] = None,
-    max_workers: int = 4,
+    max_workers: int = 6,
     include_fundamentals: bool = True,
+    deadline_sec: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """Refresh screener universe from live NSE feeds."""
+    """
+    Refresh screener universe from live NSE feeds.
+    deadline_sec: hard stop so Streamlit Cloud login never hangs forever.
+    """
     tickers = tickers or load_universe()
-    bench = fetch_ohlcv(BENCHMARK, range_param="1y", interval="1d")
+    started = time.time()
+    bench = fetch_ohlcv(BENCHMARK, range_param="6mo", interval="1d")
     rows: List[Dict[str, Any]] = []
 
     def _one(sym: str) -> Optional[Dict[str, Any]]:
@@ -484,7 +771,19 @@ def refresh_universe_live(
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_one, t): t for t in tickers}
         for fut in as_completed(futures):
-            row = fut.result()
+            if deadline_sec is not None and (time.time() - started) >= deadline_sec:
+                logger.warning(
+                    "Universe refresh hit deadline (%.0fs) — returning %s rows",
+                    deadline_sec,
+                    len(rows),
+                )
+                for pending in futures:
+                    pending.cancel()
+                break
+            try:
+                row = fut.result(timeout=1)
+            except Exception:
+                continue
             if row:
                 rows.append(row)
 

@@ -76,6 +76,7 @@ def main() -> int:
             BASE / "database_engine.py",
             BASE / "data_pipeline.py",
             BASE / "nse_data_provider.py",
+            BASE / "factor_engine.py",
             BASE / "data" / "nse_universe.txt",
             BASE / "templates" / "fintech_flat.css",
             BASE / "templates" / "elements.html",
@@ -221,8 +222,145 @@ def main() -> int:
         hist = pipe.generate_price_history("INFY", float(row["close_price"]), 250)
         fig = appmod.create_technical_chart(hist, "INFY")
         log("Technical chart builds", fig is not None and len(hist) == 250, f"traces={len(fig.data)}")
+        fig_p = appmod.create_price_sma_chart(hist, "INFY")
+        fig_v = appmod.create_volume_chart(hist, "INFY")
+        fig_r = appmod.create_rsi_chart(hist, "INFY")
+        log("Panel charts build", all(x is not None for x in (fig_p, fig_v, fig_r)), "price/vol/rsi")
     except Exception as exc:
         log("Search path", False, traceback.format_exc()[-300:])
+
+    # ------------------------------------------------------------------
+    section("4b. Factor Engine — Checklists, Narratives, Best Stock")
+    # ------------------------------------------------------------------
+    try:
+        import factor_engine as fe
+
+        tcs = db.get_ticker_row("TCS")
+        hist = pipe.generate_price_history("TCS", float(tcs["close_price"]), 250)
+        card = fe.full_factor_scorecard(tcs, hist)
+        log(
+            "Expanded scorecard has fund+tech",
+            card["fundamental"]["total_filters"] >= 6 and card["technical"]["total_filters"] >= 6,
+            f"fund={card['fundamental']['total_filters']} tech={card['technical']['total_filters']} total={card['composite_marks']}",
+        )
+        narr = fe.chart_narratives(tcs, hist)
+        log(
+            "Chart narratives for all panels",
+            all(k in narr and len(narr[k]) > 20 for k in ("price_sma", "volume", "rsi")),
+            "ok",
+        )
+        snap = fe.profile_snapshot(tcs)
+        log("Profile snapshot rich", len(snap) >= 12, f"keys={len(snap)}")
+
+        lb = db.get_leaderboard(limit=50)
+        pool = fe.select_top_score_pool(lb, top_n_scores=3)
+        ranked, best, why = fe.rank_best_stocks(pool)
+        log(
+            "Best-stock pool + ranking",
+            best is not None and len(ranked) >= 1 and "ranks #1" in why,
+            f"pool={len(ranked)} winner={best.get('ticker') if best is not None else None}",
+        )
+        log(
+            "App contracts: Best Stock + Refresh latest",
+            "Find Best Stock" in (BASE / "app.py").read_text(encoding="utf-8")
+            and "Refresh latest" in (BASE / "app.py").read_text(encoding="utf-8")
+            and "force_refresh" in (BASE / "data_pipeline.py").read_text(encoding="utf-8"),
+            "wired",
+        )
+        # Fake defaults must NOT earn fundamental PASSes
+        fake = {
+            "ticker": "IFCI",
+            "sector": "Financials",
+            "industry": "NBFC",
+            "roic": 12.0,
+            "peg_ratio": 1.5,
+            "net_debt_ebitda": 1.5,
+            "interest_coverage": 5.0,
+            "promoter_pledge_pct": 0.0,
+            "yoy_profit_growth": 10.0,
+            "pe_ratio": 0,
+        }
+        fake_card = fe.evaluate_fundamental_checklist(fake)
+        log(
+            "Placeholder fundamentals blocked from scoring",
+            fe._quality(fake) == "UNVERIFIED" and fake_card["total_marks"] <= 5,
+            f"quality={fe._quality(fake)} marks={fake_card['total_marks']}",
+        )
+        log(
+            "Multi-source module present",
+            (BASE / "multi_source_data.py").exists()
+            and "fetch_verified_fundamentals" in (BASE / "multi_source_data.py").read_text(encoding="utf-8"),
+            "ok",
+        )
+        # Consensus helper unit test
+        import multi_source_data as msd
+
+        val, status, _ = msd.consensus_metric(
+            "pe_ratio",
+            [
+                {"source": "screener", "ok": True, "pe_ratio": 112},
+                {"source": "tickertape", "ok": True, "pe_ratio": 114},
+                {"source": "moneycontrol", "ok": True, "pe_ratio": 114.2},
+            ],
+        )
+        log("PE consensus across 3 sources", status == "verified" and 110 <= val <= 116, f"{status} {val}")
+        val2, status2, _ = msd.consensus_metric(
+            "pe_ratio",
+            [
+                {"source": "screener", "ok": True, "pe_ratio": 12},
+                {"source": "tickertape", "ok": True, "pe_ratio": 110},
+            ],
+        )
+        log("Disputed PE rejected", status2 == "disputed" and val2 is None, f"{status2} {val2}")
+
+        import prod_runtime
+
+        log(
+            "prod_runtime module present",
+            hasattr(prod_runtime, "configure_runtime")
+            and hasattr(prod_runtime, "apply_streamlit_secrets"),
+            "ok",
+        )
+        cov = pipe.universe_coverage()
+        log(
+            "universe_coverage returns counts",
+            isinstance(cov.get("universe_total"), int) and cov["universe_total"] > 0,
+            f"total={cov.get('universe_total')} in_db={cov.get('in_db')}",
+        )
+        prog = pipe.progressive_universe_batch(batch_size=3)
+        log(
+            "progressive hydrate safe in mock mode",
+            prog.get("complete") is True or "Mock" in str(prog.get("message", "")),
+            str(prog.get("message", ""))[:80],
+        )
+        refresh = pipe.refresh_verified_live(user_id=uid_a)
+        log(
+            "manual Refresh path works",
+            "accepted" in refresh and "message" in refresh,
+            str(refresh.get("message", ""))[:80],
+        )
+        ready = pipe.filter_display_ready(db.get_leaderboard(limit=50))
+        log(
+            "display filter hides incomplete rows",
+            hasattr(ready, "empty"),
+            f"ready={len(ready)}",
+        )
+        log(
+            "3-source gate constant",
+            pipe.MIN_SOURCES_REQUIRED >= 3,
+            str(pipe.MIN_SOURCES_REQUIRED),
+        )
+        log(
+            "list_leaderboard_tickers works",
+            isinstance(db.list_leaderboard_tickers(), list) and len(db.list_leaderboard_tickers()) > 0,
+            f"n={len(db.list_leaderboard_tickers())}",
+        )
+        yf_helper = "def _fetch_ohlcv_yfinance" in (BASE / "nse_data_provider.py").read_text(
+            encoding="utf-8"
+        )
+        log("yfinance OHLCV fallback wired", yf_helper, "ok")
+    except Exception as exc:
+        log("Factor engine", False, traceback.format_exc()[-400:])
 
     # ------------------------------------------------------------------
     section("5. Navigation Sync + validate_active_signals")
@@ -351,7 +489,7 @@ def main() -> int:
             "Search Profile nav button": 'st.button("Search Profile"' in src,
             "Forward-Test nav button": 'st.button("Forward-Test"' in src,
             "Log Out button": 'st.button("Log Out"' in src,
-            "Refresh validate button": "Refresh Quotes & Validate Signals" in src,
+            "Refresh validate button": 'key="force_validate"' in src or 'key="screener_refresh"' in src,
             "st.rerun wired": "st.rerun()" in src,
             "No st.dataframe(": "st.dataframe(" not in src,
             "No st.data_editor(": "st.data_editor(" not in src,

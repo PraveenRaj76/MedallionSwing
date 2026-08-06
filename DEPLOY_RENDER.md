@@ -25,18 +25,25 @@ cd "C:\Users\prdhan\OneDrive - ASSA ABLOY Group\Desktop\Medallion Swing\medallio
 
 ## Streamlit Community Cloud (recommended free, no credit card)
 
+**Full production mode (not partial):** the app now hydrates the **full Nifty universe in-app** (progressive batches + auto fundamentals). No CLI on the server. Price path is Yahoo chart → yfinance → Tickertape/Moneycontrol/Screener CMP.
+
 **Deploy failed on Python 3.14?** Cloud ignores `runtime.txt`. You must set Python in the UI.
 
-1. Push latest `requirements.txt` to GitHub  
+1. Push latest code + `requirements.txt` to GitHub  
 2. In [share.streamlit.io](https://share.streamlit.io) → your app → **Settings** (or delete & redeploy)  
 3. **Advanced settings → Python version → 3.12** (or 3.11) — **not 3.14**  
 4. Main file: `app.py` · Reboot / Redeploy  
-5. Secrets (optional):
+5. Secrets (recommended — paste from `.streamlit/secrets.toml.example`):
 
 ```toml
 MEDALLION_MARKET_MODE = "live"
 MEDALLION_SSL_VERIFY = "1"
+MEDALLION_HYDRATE_BATCH = "12"
+MEDALLION_FUND_BATCH = "4"
 ```
+
+6. After login: leave **Auto-fill full universe** on. Screener progress bar fills toward Nifty 500 while you use Search / Forward-Test.  
+7. Optional cold-start boost: set `MEDALLION_SEED_DB_URL` to a hosted copy of your local `medallion_system.db` so redeploys/sleep wake with data already loaded.
 
 ---
 
